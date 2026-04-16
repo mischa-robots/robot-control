@@ -1,0 +1,50 @@
+[package]
+name = "robot-control"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Mischa <mischa.robots@gmail.com>"]
+description = "A Rust library for controlling DC motor robots via PCA9685 PWM boards over I2C"
+homepage = "https://mischa-robots.github.io/"
+repository = "https://github.com/mischa-robots/robot-control"
+license = "MIT"
+keywords = ["robot", "motor", "pca9685", "i2c", "embedded"]
+categories = ["embedded", "hardware-support", "science::robotics"]
+readme = "README.md"
+
+[features]
+default = []
+pca9685 = ["dep:pwm-pca9685", "dep:linux-embedded-hal"]
+
+[dependencies]
+pwm-pca9685 = { version = "1.0.0", optional = true }
+linux-embedded-hal = { version = "0.4", optional = true }
+tokio = { version = "1.38.0", features = ["rt", "sync", "time", "macros"] }
+tokio-util = "0.7"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+actix = "0.13.3"
+actix-web = "4.6.0"
+actix-files = "0.6.5"
+actix-web-actors = "4.3.0"
+actix-rt = "2.9.0"
+clap = { version = "4", features = ["derive"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1.38.0", features = ["full"] }
+
+[profile.dev]
+incremental = true
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+strip = true
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
