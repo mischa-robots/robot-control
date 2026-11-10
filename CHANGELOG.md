@@ -7,6 +7,21 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## Unreleased
 
+## 0.1.2
+
+### Fixed
+
+- Validate robot configuration before starting the controller task: motor ports must differ, adjustment interval and step must be positive, step and factors must be finite, and the derived step/interval rate must be positive and finite in `f32`.
+- Reject non-finite drive inputs without replacing either motor target.
+- Clamp factored motor demands to the supported range, retaining finite gain factors (including zero and negative factors) and preventing out-of-range PWM output.
+
+### Added
+
+- Mock regression tests for invalid configuration/commands, extreme finite factors, PWM bounds, and compatibility with existing config literals, custom drivers and error matches.
+- Bounded `controller_check` hardware example and README procedure for validating the changes on M1/M4, including negative polarity and rejected commands/configurations.
+
+Existing public signatures, motor defaults, ramp interval, PWM mapping and shutdown behavior are unchanged.
+
 ## 0.1.1 - 2026-11-10
 
 ### Added

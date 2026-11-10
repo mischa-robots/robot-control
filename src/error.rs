@@ -9,11 +9,11 @@ pub enum MotorError {
     #[error("I2C error: {0}")]
     I2c(String),
 
-    /// A PWM controller operation failed.
+    /// A PWM controller operation or drive input validation failed.
     #[error("PWM error: {0}")]
     Pwm(String),
 
-    /// The motor driver failed to initialize.
+    /// The motor driver failed to initialize, or robot configuration was invalid.
     #[error("initialization failed: {0}")]
     Init(String),
 }
@@ -21,7 +21,7 @@ pub enum MotorError {
 /// Errors that can occur when controlling the robot.
 #[derive(Debug, Error)]
 pub enum RobotError {
-    /// A motor driver operation failed.
+    /// A motor driver operation or controller validation failed.
     #[error(transparent)]
     Motor(#[from] MotorError),
 

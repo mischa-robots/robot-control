@@ -18,21 +18,55 @@ use crate::motor::{Motor, MotorDriver};
 
 /// Configuration for a [`Robot`] instance.
 ///
-/// Use the builder methods or [`Default`] for sensible defaults.
+/// Start with [`Default`] and override individual fields. [`Robot::new`] validates
+/// the configuration before starting its background task.
 #[derive(Debug, Clone)]
 pub struct RobotConfig {
-    /// Factor applied to the left motor speed (use `-1.0` to reverse polarity).
+    /// Finite left motor factor (`-1.0` reverses polarity, zero disables demand).
+    /// The factored demand is clamped to `[-1.0, 1.0]`.
     pub left_motor_factor: f32,
-    /// Factor applied to the right motor speed (use `-1.0` to reverse polarity).
+    /// Finite right motor factor (`-1.0` reverses polarity, zero disables demand).
+    /// The factored demand is clamped to `[-1.0, 1.0]`.
     pub right_motor_factor: f32,
     /// Which motor is the left motor.
     pub left_motor: Motor,
-    /// Which motor is the right motor.
+    /// Which motor is the right motor (must differ from the left motor).
     pub right_motor: Motor,
-    /// Speed adjustment step per tick (controls ramp smoothness).
+    /// Positive, finite speed adjustment step per tick (controls ramp smoothness).
     pub adjustment_step: f32,
-    /// Interval between motor adjustment ticks.
+    /// Positive interval between motor adjustment ticks. Step divided by interval
+    /// in seconds must also be positive and finite in `f32`.
     pub adjustment_interval: Duration,
+}
+
+impl RobotConfig {
+    fn validate(&self) -> Result<(), RobotError> {
+        let invalid = |reason: &str| {
+            RobotError::Motor(MotorError::Init(format!("invalid RobotConfig: {reason}")))
+        };
+        if self.left_motor == self.right_motor {
+            return Err(invalid("left_motor and right_motor must differ"));
+        }
+        if self.adjustment_interval.is_zero() {
+            return Err(invalid("adjustment_interval must be positive"));
+        }
+        if !self.adjustment_step.is_finite() || self.adjustment_step <= 0.0 {
+            return Err(invalid("adjustment_step must be finite and positive"));
+        }
+        let rate = self.adjustment_step / self.adjustment_interval.as_secs_f32();
+        if !rate.is_finite() || rate <= 0.0 {
+            return Err(invalid(
+                "adjustment_step / adjustment_interval must yield a finite, positive f32 rate",
+            ));
+        }
+        if !self.left_motor_factor.is_finite() {
+            return Err(invalid("left_motor_factor must be finite"));
+        }
+        if !self.right_motor_factor.is_finite() {
+            return Err(invalid("right_motor_factor must be finite"));
+        }
+        Ok(())
+    }
 }
 
 impl Default for RobotConfig {
@@ -74,11 +108,14 @@ impl Robot {
     ///
     /// # Errors
     ///
-    /// Returns [`RobotError`] if the configuration is invalid.
+    /// Returns [`RobotError::Motor`] wrapping [`MotorError::Init`] if the
+    /// configuration is invalid. No controller task or driver writes are started
+    /// on validation failure; constructing the driver itself may access hardware.
     pub fn new(
         motor_board: Arc<Mutex<dyn MotorDriver>>,
         config: RobotConfig,
     ) -> Result<Arc<Self>, RobotError> {
+        config.validate()?;
         let cancel_token = CancellationToken::new();
         let robot = Arc::new(Self {
             motor_board,
@@ -99,19 +136,29 @@ impl Robot {
 
     /// Set target motor speeds.
     ///
-    /// Values are clamped to `[-1.0, 1.0]`. Motor factors from [`RobotConfig`]
-    /// are applied automatically.
+    /// Finite values are clamped to `[-1.0, 1.0]`, multiplied by the motor factors
+    /// from [`RobotConfig`], then clamped again to the supported output range.
+    /// A non-finite input rejects the entire command without changing targets.
     ///
     /// # Errors
     ///
     /// Returns [`RobotError::Shutdown`] if the robot has been shut down.
+    /// Returns [`RobotError::Motor`] wrapping [`MotorError::Pwm`] for a non-finite
+    /// input, retaining the existing error API.
     pub async fn drive(&self, left: f32, right: f32) -> Result<(), RobotError> {
         if self.cancel_token.is_cancelled() {
             return Err(RobotError::Shutdown);
         }
 
-        let left = left.clamp(-1.0, 1.0) * self.config.left_motor_factor;
-        let right = right.clamp(-1.0, 1.0) * self.config.right_motor_factor;
+        if !left.is_finite() || !right.is_finite() {
+            return Err(MotorError::Pwm(
+                "invalid drive command: left and right must both be finite".into(),
+            )
+            .into());
+        }
+
+        let left = scaled_demand(left, self.config.left_motor_factor);
+        let right = scaled_demand(right, self.config.right_motor_factor);
 
         *self.target_left_speed.lock().await = left;
         *self.target_right_speed.lock().await = right;
@@ -194,6 +241,17 @@ impl Robot {
     }
 }
 
+/// Inputs and factors have been validated; clamp before and after scaling.
+fn scaled_demand(input: f32, factor: f32) -> f32 {
+    let demand = f64::from(input.clamp(-1.0, 1.0)) * f64::from(factor);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "bounded demand fits in f32"
+    )]
+    let demand = demand.clamp(-1.0, 1.0) as f32;
+    demand
+}
+
 /// Ramp `current` toward `target` by at most `step`.
 fn ramp_toward(current: f32, target: f32, step: f32) -> f32 {
     if (current - target).abs() > step {
@@ -238,6 +296,122 @@ fn apply_motor_speed(
 mod tests {
     use super::*;
     use crate::mock::{MockMotorDriver, MotorCommand};
+
+    // No Tokio runtime: invalid configurations must return before tokio::spawn.
+    #[test]
+    fn invalid_config_never_starts_controller() {
+        let mut cases = vec![
+            (
+                RobotConfig {
+                    right_motor: Motor::Motor1,
+                    ..RobotConfig::default()
+                },
+                "must differ",
+            ),
+            (
+                RobotConfig {
+                    adjustment_interval: Duration::ZERO,
+                    ..RobotConfig::default()
+                },
+                "adjustment_interval",
+            ),
+            (
+                RobotConfig {
+                    adjustment_step: f32::MAX,
+                    ..RobotConfig::default()
+                },
+                "rate",
+            ),
+            (
+                RobotConfig {
+                    adjustment_step: f32::from_bits(1),
+                    adjustment_interval: Duration::MAX,
+                    ..RobotConfig::default()
+                },
+                "rate",
+            ),
+        ];
+        for step in [0.0, -0.1, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            cases.push((
+                RobotConfig {
+                    adjustment_step: step,
+                    ..RobotConfig::default()
+                },
+                "adjustment_step",
+            ));
+        }
+        for factor in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            cases.push((
+                RobotConfig {
+                    left_motor_factor: factor,
+                    ..RobotConfig::default()
+                },
+                "left_motor_factor",
+            ));
+            cases.push((
+                RobotConfig {
+                    right_motor_factor: factor,
+                    ..RobotConfig::default()
+                },
+                "right_motor_factor",
+            ));
+        }
+        for (config, expected) in cases {
+            let driver = Arc::new(Mutex::new(MockMotorDriver::new()));
+            let Err(RobotError::Motor(MotorError::Init(message))) =
+                Robot::new(driver.clone(), config)
+            else {
+                panic!("expected configuration error for {expected}");
+            };
+            assert!(message.contains(expected), "{message}");
+            assert_eq!(Arc::strong_count(&driver), 1);
+            assert_eq!(driver.try_lock().unwrap().command_count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_drive_preserves_both_targets() {
+        let driver = Arc::new(Mutex::new(MockMotorDriver::new()));
+        let robot = Robot::new(driver.clone(), RobotConfig::default()).unwrap();
+        robot.drive(0.25, -0.5).await.unwrap();
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for (left, right) in [(invalid, 0.75), (0.75, invalid), (invalid, invalid)] {
+                assert!(matches!(
+                    robot.drive(left, right).await,
+                    Err(RobotError::Motor(MotorError::Pwm(_)))
+                ));
+                assert_eq!(*robot.target_left_speed.lock().await, 0.25);
+                assert_eq!(*robot.target_right_speed.lock().await, -0.5);
+            }
+        }
+        robot.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn finite_factors_scale_then_saturate() {
+        for (factor, input, expected) in [
+            (2.0, 0.75, 1.0),
+            (-2.0, 0.75, -1.0),
+            (0.5, 2.0, 0.5), // Clamp input before applying the factor.
+            (0.0, f32::MAX, 0.0),
+            (f32::MAX, f32::MAX, 1.0),
+            (f32::MAX, -f32::MAX, -1.0),
+            (-f32::MAX, -f32::MAX, 1.0),
+            (f32::MAX, 0.0, 0.0),
+        ] {
+            let driver = Arc::new(Mutex::new(MockMotorDriver::new()));
+            let config = RobotConfig {
+                left_motor_factor: factor,
+                right_motor_factor: factor,
+                ..RobotConfig::default()
+            };
+            let robot = Robot::new(driver, config).unwrap();
+            robot.drive(input, input).await.unwrap();
+            assert_eq!(*robot.target_left_speed.lock().await, expected);
+            assert_eq!(*robot.target_right_speed.lock().await, expected);
+            robot.shutdown().await;
+        }
+    }
 
     #[test]
     fn ramp_toward_moves_by_step() {

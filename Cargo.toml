@@ -1,6 +1,6 @@
 [package]
 name = "robot-control"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Mischa <mischa.robots@gmail.com>"]
@@ -34,7 +34,7 @@ actix-web-actors = "4.3.0"
 actix-rt = "2.9.0"
 clap = { version = "4", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tokio = { version = "1.38.0", features = ["full"] }
+tokio = { version = "1.38.0", features = ["full", "test-util"] }
 
 [profile.dev]
 incremental = true
@@ -48,3 +48,7 @@ strip = true
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
+
+[[example]]
+name = "controller_check"
+required-features = ["pca9685"]
