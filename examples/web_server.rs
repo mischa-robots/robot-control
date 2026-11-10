@@ -23,7 +23,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use robot_control::motor::MotorDriver;
+use robot_control::motor::{Motor, MotorDriver};
 use robot_control::robot::{Robot, RobotConfig};
 
 // ---------------------------------------------------------------------------
@@ -51,16 +51,42 @@ struct Cli {
     i2c_addr: u8,
 
     /// Left motor speed factor (-1.0 to reverse polarity).
-    #[arg(long, default_value_t = -1.0)]
+    #[arg(long, default_value_t = 1.0, allow_hyphen_values = true)]
     left_factor: f32,
 
     /// Right motor speed factor (-1.0 to reverse polarity).
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, default_value_t = 1.0, allow_hyphen_values = true)]
     right_factor: f32,
 
     /// Path to static web files directory.
     #[arg(long, default_value = "./static")]
     static_dir: PathBuf,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::Parser;
+
+    #[test]
+    fn accepts_negative_motor_factors() {
+        let cli = Cli::try_parse_from([
+            "web_server",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "8080",
+            "--left-factor",
+            "-1.0",
+            "--right-factor",
+            "-0.5",
+        ])
+        .expect("negative motor factors should be accepted");
+
+        assert_eq!(cli.left_factor, -1.0);
+        assert_eq!(cli.right_factor, -0.5);
+        assert_eq!(cli.port, 8080);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +240,8 @@ async fn main() -> std::io::Result<()> {
 
     let motor_board = create_motor_driver(&cli);
     let config = RobotConfig {
+        left_motor: Motor::Motor1,
+        right_motor: Motor::Motor4,
         left_motor_factor: cli.left_factor,
         right_motor_factor: cli.right_factor,
         ..RobotConfig::default()

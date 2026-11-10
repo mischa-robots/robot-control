@@ -40,7 +40,8 @@
         const leftJoystick = document.getElementById('leftJoystick');
         const rightJoystick = document.getElementById('rightJoystick');
 
-        const socket = new WebSocket(`ws://${location.hostname}:8000/ws`);
+        const socketProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const socket = new WebSocket(`${socketProtocol}//${location.host}/ws`);
 
         socket.onopen = () => {
             console.log('WebSocket connection established');
@@ -51,6 +52,9 @@
         };
 
         function sendDriveCommand(left, right) {
+            if (socket.readyState !== WebSocket.OPEN) {
+                return;
+            }
             const message = JSON.stringify({ left, right });
             socket.send(message);
         }

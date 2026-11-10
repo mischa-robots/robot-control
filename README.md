@@ -105,6 +105,14 @@ Then open `http://<robot-ip>:8000` in a browser for the joystick control UI.
 | `/drive?left=0.5&right=0.5` | GET | One-shot drive command |
 | `/health` | GET | Health check |
 
+### Motor Test Example
+
+`examples/test.rs` tests M1–M4 one at a time, ramping each to full speed forward and reverse with a stop between directions. Requires PCA9685 hardware; defaults to `/dev/i2c-1` at address `0x60` (override with `--i2c-bus` and `--i2c-addr`, using a decimal address).
+
+```bash
+cargo run --example test --features pca9685
+```
+
 ## Architecture
 
 ```
