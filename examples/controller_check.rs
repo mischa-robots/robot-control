@@ -6,7 +6,10 @@ use robot_control::{Motor, MotorDriver, Pca9685MotorBoard, Robot, RobotConfig, R
 use tokio::sync::Mutex;
 
 #[derive(Parser)]
-#[command(about = "Check controller validation and a bounded two-motor sequence")]
+#[command(
+    version,
+    about = "Check controller validation and a bounded two-motor sequence"
+)]
 struct Cli {
     #[arg(long, default_value = "/dev/i2c-1")]
     i2c_bus: String,
@@ -26,6 +29,9 @@ struct Cli {
     /// Finite requested power in (0, 1]; factors are applied afterward.
     #[arg(long, default_value_t = 0.25)]
     power: f32,
+    /// Append alternating forward/pivot commands to check paired target changes.
+    #[arg(long)]
+    paired_targets: bool,
 }
 
 fn motor(number: u8) -> Motor {
@@ -37,7 +43,7 @@ fn motor(number: u8) -> Motor {
     }
 }
 
-async fn sequence(robot: &Robot, power: f32) -> Result<(), RobotError> {
+async fn sequence(robot: &Robot, power: f32, paired_targets: bool) -> Result<(), RobotError> {
     for (name, left, right) in [
         ("zero", 0.0, 0.0),
         ("left only", power, 0.0),
@@ -51,6 +57,22 @@ async fn sequence(robot: &Robot, power: f32) -> Result<(), RobotError> {
         println!("{name}: left={left}, right={right} (one second including ramp)");
         robot.drive(left, right).await?;
         tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    if paired_targets {
+        for (name, left, right) in [
+            ("forward", power, power),
+            ("pivot right", power, -power),
+            ("forward", power, power),
+            ("pivot left", -power, power),
+            ("forward", power, power),
+            ("zero", 0.0, 0.0),
+        ] {
+            println!(
+                "paired targets / {name}: left={left}, right={right} (one second including ramp)"
+            );
+            robot.drive(left, right).await?;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
     }
     // The valid left input must not replace the preceding zero target when the
     // right input is invalid. Hardware should remain at zero throughout.
@@ -107,7 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let result: Result<(), Box<dyn std::error::Error>> = tokio::select! {
-        result = sequence(&robot, cli.power) => result.map_err(Into::into),
+        result = sequence(&robot, cli.power, cli.paired_targets) => result.map_err(Into::into),
         result = interrupted() => result.map_err(Into::into),
     };
     robot.shutdown().await;

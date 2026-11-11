@@ -7,6 +7,20 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## Unreleased
 
+## 0.1.3
+
+### Fixed
+
+- Accept left/right targets atomically in `drive` and `stop`, and read one paired snapshot per adjustment tick so concurrent commands cannot produce mixed targets.
+- Synchronize command admission and shutdown cancellation with the same target lock; commands waiting behind shutdown cannot replace targets after admission closes.
+
+### Added
+
+- Barrier-coordinated concurrent drive/stop regression tests, deterministic queued-command admission checks, and mock adjustment-loop checks for complete pairs.
+- Optional `--paired-targets` sequence in `controller_check` for bounded alternating forward/pivot hardware checks, with a README procedure.
+
+Public APIs, defaults, per-motor ramping and electrical behavior are unchanged. Target acceptance is atomic; physical motor writes remain sequential.
+
 ## 0.1.2
 
 ### Fixed

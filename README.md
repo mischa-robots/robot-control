@@ -84,6 +84,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 The public API and defaults are unchanged. To preserve existing error enum matches, configuration errors use `RobotError::Motor(MotorError::Init(...))` and invalid drive inputs use `RobotError::Motor(MotorError::Pwm(...))`, with validation details in the message. These errors do not imply an I2C transaction was attempted.
 
+### Paired targets (0.1.3)
+
+`drive(left, right)` accepts both targets atomically, and `stop()` atomically replaces the pair with zero. Each adjustment tick reads one complete pair, even when commands run concurrently. Commands waiting behind shutdown recheck admission under the same lock and return `RobotError::Shutdown` without changing targets once cancellation has begun.
+
+Successful `drive` means target acceptance. Each motor still ramps independently, and the driver writes the left and right outputs sequentially. This patch does not change ramp timing, polarity, PWM mapping or electrical stopping. Shutdown still does not join the adjustment task; ordered shutdown and last-handle cleanup are later checkpoints.
+
 ### Web Server Example
 
 The repository includes a full web server example (`examples/web_server.rs`) with a dual-joystick UI:
@@ -150,7 +156,7 @@ Then open `http://<robot-ip>:8000` in a browser for the joystick control UI.
 cargo run --example test --features pca9685
 ```
 
-### Controller verification on hardware (0.1.2)
+### Controller verification on hardware
 
 `controller_check` exercises `Robot`, unlike the raw M1–M4 motor test. It defaults to left M1/right M4, factors +1, and power 0.25. Keep the tracks clear of the surface, use a power that moves your motors safely, and keep a power cutoff accessible. Stop any other process controlling the board first.
 
@@ -162,6 +168,14 @@ cargo run --example controller_check --features pca9685 -- --power 0.25 --left-f
 
 The bounded sequence prints each stage: zero, left-only, zero, right-only, forward, zero, reverse, zero (one second each, including ramp). It then submits a valid left demand with a NaN right demand. Expect an `Expected invalid-input rejection` message and both tracks to remain at zero for another second, followed by explicit shutdown. This does not measure wheel speed or confirm hardware output through sensors. Ctrl-C/SIGTERM also requests shutdown; existing shutdown limitations are unchanged in this patch.
 
+For the paired-target check, run the same baseline with the optional extension:
+
+```bash
+cargo run --example controller_check --features pca9685 -- --power 0.25 --paired-targets
+```
+
+After the baseline, expect six additional `paired targets / ...` stages: forward, pivot right, forward, pivot left, forward, zero, each held for one second including ramp. Forward requests `(power, power)`, pivot right `(power, -power)`, and pivot left `(-power, power)` before motor factors. The invalid-input check and explicit shutdown follow as usual; the complete sequence takes about 15 seconds. Check left-only/right-only and pivot directions against your calibrated wiring and the expected behavior, looking for unexpected transient combinations. Independent ramps can produce intermediate output pairs during transitions; barrier-coordinated mock tests verify atomic target acceptance, which visual observation cannot prove.
+
 Check configuration rejection separately:
 
 ```bash
@@ -170,8 +184,6 @@ cargo run --example controller_check --features pca9685 -- --interval-ms 0
 ```
 
 Both should print `Controller rejected configuration`, exit with an error and never begin the motion sequence. The example opens and stops the board before creating the controller, so these are not tests of hardware-free startup. Use `--i2c-bus /dev/i2c-1 --i2c-addr 96` to override the connection and `--left-motor`/`--right-motor` to match your wiring. Avoid large factors on hardware: they can saturate at full power; mock tests cover those extremes.
-
-Compare directions and the unchanged baseline sequence with 0.1.1. Record wiring, factors, requested power and results. Unexpected movement or continuing output after shutdown should end the test using the power cutoff. Automated tests verify rejection before task startup, preservation of both targets, and bounded PWM output without connecting hardware.
 
 
 ## Feature Flags
