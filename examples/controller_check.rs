@@ -16,9 +16,9 @@ struct Cli {
     /// Decimal address (96 = 0x60).
     #[arg(long, default_value_t = 96)]
     i2c_addr: u8,
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=4))]
-    left_motor: u8,
     #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=4))]
+    left_motor: u8,
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=4))]
     right_motor: u8,
     #[arg(long, default_value_t = 1.0, allow_hyphen_values = true)]
     left_factor: f32,

@@ -26,8 +26,8 @@ async fn saturated_commands_reach_driver_as_bounded_pwm() {
     let log = driver.0.clone();
     // Explicit literal ensures no mandatory public fields have been added.
     let config = RobotConfig {
-        left_motor: Motor::Motor1,
-        right_motor: Motor::Motor4,
+        left_motor: Motor::Motor4,
+        right_motor: Motor::Motor1,
         left_motor_factor: f32::MAX,
         right_motor_factor: -f32::MAX,
         adjustment_step: 1.0,
@@ -48,8 +48,8 @@ async fn saturated_commands_reach_driver_as_bounded_pwm() {
         assert_eq!(
             &commands[commands.len() - 2..],
             &[
-                (Motor::Motor1, 4095, left_forward),
-                (Motor::Motor4, 4095, right_forward)
+                (Motor::Motor4, 4095, left_forward),
+                (Motor::Motor1, 4095, right_forward)
             ]
         );
     }
@@ -59,7 +59,7 @@ async fn saturated_commands_reach_driver_as_bounded_pwm() {
     let commands = log.lock().unwrap().clone();
     assert_eq!(
         &commands[commands.len() - 2..],
-        &[(Motor::Motor1, 0, false), (Motor::Motor4, 0, false)]
+        &[(Motor::Motor4, 0, false), (Motor::Motor1, 0, false)]
     );
     robot.shutdown().await;
 }

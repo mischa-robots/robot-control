@@ -7,6 +7,21 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## Unreleased
 
+## 0.1.4
+
+### Fixed
+
+- The default `MotorDriver::stop_all` attempts M1–M4 in order even when earlier stops fail, returning all failed motor diagnostics through the existing `MotorError::Pwm` variant.
+- `Pca9685MotorBoard::stop_motor` attempts all six writes in the existing zero-output sequence even after a write fails, reporting every failed motor/channel/operation and its underlying diagnostic.
+- Correct swapped left/right assignments in the web server and controller hardware-check examples: left is M4, right is M1. Update the matching mock output expectations and hardware instructions.
+
+### Added
+
+- Hardware-free failure-injection tests covering every subset of motor-stop failures and every subset of individual stop-write failures on all four channel maps, including successful write order and zero values.
+- Documentation of custom `stop_all` override responsibilities, uncertain output after stop errors, and the v0.1.4 operator verification procedure.
+
+Public signatures and error variants are unchanged. Healthy-board write order, electrical values, polarity, prescale and ramping are preserved.
+
 ## 0.1.3
 
 ### Fixed

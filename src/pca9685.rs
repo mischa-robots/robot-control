@@ -62,6 +62,53 @@ const fn channels_for(motor: Motor) -> DcChannels {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopWrite {
+    On,
+    Off,
+}
+
+impl StopWrite {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::On => "set_channel_on",
+            Self::Off => "set_channel_off",
+        }
+    }
+}
+
+// Keep the stop sequence private and inject only the individual write for tests.
+// This is the existing six-write sequence, including its order and zero values.
+fn stop_motor_outputs<E: std::fmt::Debug>(
+    motor: Motor,
+    mut write: impl FnMut(Channel, StopWrite, u16) -> Result<(), E>,
+) -> Result<(), MotorError> {
+    let channels = channels_for(motor);
+    let mut failures = Vec::new();
+    for channel in [
+        channels.ref_channel,
+        channels.forward_channel,
+        channels.backward_channel,
+    ] {
+        for operation in [StopWrite::On, StopWrite::Off] {
+            if let Err(error) = write(channel, operation, 0) {
+                failures.push(format!(
+                    "{motor:?} channel {channel:?} {}(0): {error:?}",
+                    operation.name()
+                ));
+            }
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(MotorError::Pwm(format!(
+            "stop_motor failed: {}",
+            failures.join("; ")
+        )))
+    }
+}
+
 /// A motor driver backed by a PCA9685 PWM controller over I2C.
 ///
 /// This implementation uses [`linux_embedded_hal::I2cdev`] for I2C communication
@@ -147,26 +194,79 @@ impl MotorDriver for Pca9685MotorBoard {
         Ok(())
     }
 
+    /// Attempt all six zero-output writes, collecting motor/channel/operation
+    /// diagnostics if any fail. Failure leaves the actual output uncertain.
     fn stop_motor(&self, motor: Motor) -> Result<(), MotorError> {
-        let channels = channels_for(motor);
-        let mut pwm = self
-            .pwm
-            .lock()
-            .map_err(|e| MotorError::Pwm(format!("mutex poisoned: {e}")))?;
+        let mut pwm = self.pwm.lock().map_err(|e| {
+            MotorError::Pwm(format!("{motor:?} stop_motor lock: mutex poisoned: {e}"))
+        })?;
 
-        pwm.set_channel_on(channels.ref_channel, 0)
-            .map_err(|e| MotorError::Pwm(format!("{e:?}")))?;
-        pwm.set_channel_off(channels.ref_channel, 0)
-            .map_err(|e| MotorError::Pwm(format!("{e:?}")))?;
-        pwm.set_channel_on(channels.forward_channel, 0)
-            .map_err(|e| MotorError::Pwm(format!("{e:?}")))?;
-        pwm.set_channel_off(channels.forward_channel, 0)
-            .map_err(|e| MotorError::Pwm(format!("{e:?}")))?;
-        pwm.set_channel_on(channels.backward_channel, 0)
-            .map_err(|e| MotorError::Pwm(format!("{e:?}")))?;
-        pwm.set_channel_off(channels.backward_channel, 0)
-            .map_err(|e| MotorError::Pwm(format!("{e:?}")))?;
+        stop_motor_outputs(motor, |channel, operation, value| match operation {
+            StopWrite::On => pwm.set_channel_on(channel, value),
+            StopWrite::Off => pwm.set_channel_off(channel, value),
+        })
+    }
+}
 
-        Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn motor_stop_attempts_all_writes_and_collects_failures() {
+        // Explicit expected maps protect the existing electrical order instead
+        // of deriving expectations from the production channel mapping.
+        for (motor, channels) in [
+            (Motor::Motor1, [Channel::C8, Channel::C9, Channel::C10]),
+            (Motor::Motor2, [Channel::C13, Channel::C11, Channel::C12]),
+            (Motor::Motor3, [Channel::C2, Channel::C3, Channel::C4]),
+            (Motor::Motor4, [Channel::C7, Channel::C5, Channel::C6]),
+        ] {
+            let expected = [
+                (channels[0], StopWrite::On, 0),
+                (channels[0], StopWrite::Off, 0),
+                (channels[1], StopWrite::On, 0),
+                (channels[1], StopWrite::Off, 0),
+                (channels[2], StopWrite::On, 0),
+                (channels[2], StopWrite::Off, 0),
+            ];
+            // Every subset includes first/middle/final write failures, combined
+            // failures, a completely failing bus and the successful sequence.
+            for failures in 0_u8..64 {
+                let mut attempts = Vec::new();
+                let result = stop_motor_outputs(motor, |channel, operation, value| {
+                    let index = attempts.len();
+                    attempts.push((channel, operation, value));
+                    if failures & (1 << index) == 0 {
+                        Ok(())
+                    } else {
+                        Err(format!("injected failure {index}"))
+                    }
+                });
+                assert_eq!(attempts, expected);
+                if failures == 0 {
+                    assert!(result.is_ok());
+                    continue;
+                }
+                let Err(MotorError::Pwm(message)) = result else {
+                    panic!("expected stop failure for {motor:?}, mask {failures}");
+                };
+                for (index, (channel, _, _)) in expected.iter().enumerate() {
+                    let operation = if index % 2 == 0 {
+                        "set_channel_on"
+                    } else {
+                        "set_channel_off"
+                    };
+                    let diagnostic = format!(
+                        "{motor:?} channel {channel:?} {operation}(0): \"injected failure {index}\""
+                    );
+                    assert_eq!(message.contains(&diagnostic), failures & (1 << index) != 0);
+                }
+                assert_eq!(
+                    message.matches("injected failure").count(),
+                    failures.count_ones() as usize
+                );
+            }
+        }
     }
 }

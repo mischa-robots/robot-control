@@ -9,7 +9,8 @@ pub enum MotorError {
     #[error("I2C error: {0}")]
     I2c(String),
 
-    /// A PWM controller operation or drive input validation failed.
+    /// A PWM controller operation, drive input validation, or stopping failed.
+    /// Stop failures may collect multiple operation diagnostics in the message.
     #[error("PWM error: {0}")]
     Pwm(String),
 

@@ -240,8 +240,8 @@ async fn main() -> std::io::Result<()> {
 
     let motor_board = create_motor_driver(&cli);
     let config = RobotConfig {
-        left_motor: Motor::Motor1,
-        right_motor: Motor::Motor4,
+        left_motor: Motor::Motor4,
+        right_motor: Motor::Motor1,
         left_motor_factor: cli.left_factor,
         right_motor_factor: cli.right_factor,
         ..RobotConfig::default()

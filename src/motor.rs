@@ -42,16 +42,29 @@ pub trait MotorDriver: Send + Sync {
     /// Returns [`MotorError`] if the hardware communication fails.
     fn stop_motor(&self, motor: Motor) -> Result<(), MotorError>;
 
-    /// Stop all motors. The default implementation stops each motor individually.
+    /// Stop all motors. The default implementation attempts M1–M4 in order,
+    /// even if an earlier motor fails to stop.
+    ///
+    /// Custom overrides must provide their own exhaustive stopping behavior.
     ///
     /// # Errors
     ///
-    /// Returns [`MotorError`] if any hardware communication fails.
+    /// Returns [`MotorError::Pwm`] if any stop fails, collecting every failed
+    /// motor and its original diagnostic. An error means outputs are uncertain.
     fn stop_all(&self) -> Result<(), MotorError> {
-        self.stop_motor(Motor::Motor1)?;
-        self.stop_motor(Motor::Motor2)?;
-        self.stop_motor(Motor::Motor3)?;
-        self.stop_motor(Motor::Motor4)?;
-        Ok(())
+        let mut failures = Vec::new();
+        for motor in [Motor::Motor1, Motor::Motor2, Motor::Motor3, Motor::Motor4] {
+            if let Err(error) = self.stop_motor(motor) {
+                failures.push(format!("{motor:?} stop_motor: {error}"));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(MotorError::Pwm(format!(
+                "stop_all failed: {}",
+                failures.join("; ")
+            )))
+        }
     }
 }

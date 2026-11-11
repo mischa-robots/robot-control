@@ -58,20 +58,23 @@ use tokio::sync::Mutex;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // With real hardware (requires `pca9685` feature):
-    // let board = robot_control::Pca9685MotorBoard::new("/dev/i2c-1", 0x60)?;
-    // let driver: Arc<Mutex<dyn MotorDriver>> = Arc::new(Mutex::new(board));
+    let board = robot_control::Pca9685MotorBoard::new("/dev/i2c-1", 0x60)?;
+    let driver: Arc<Mutex<dyn MotorDriver>> = Arc::new(Mutex::new(board));
 
     // Configure motor factors (use -1.0 to reverse a motor's polarity)
     let config = RobotConfig {
+        left_motor: Motor::Motor4,
+        right_motor: Motor::Motor1,
         left_motor_factor: -1.0,
         right_motor_factor: 1.0,
         ..RobotConfig::default()
     };
 
-    // let robot = Robot::new(driver, config)?;
-    // robot.drive(0.5, 0.5).await?;   // drive forward at 50% speed
-    // robot.stop().await?;              // ramp down to zero
-    // robot.shutdown().await;            // stop motors and cancel background task
+    let robot = Robot::new(driver, config)?;
+    robot.drive(0.5, 0.5).await?;   // drive forward at 50% speed
+    robot.stop().await?;              // ramp down to zero
+    robot.shutdown().await;            // stop motors and cancel background task
+    
     Ok(())
 }
 ```
@@ -90,9 +93,19 @@ The public API and defaults are unchanged. To preserve existing error enum match
 
 Successful `drive` means target acceptance. Each motor still ramps independently, and the driver writes the left and right outputs sequentially. This patch does not change ramp timing, polarity, PWM mapping or electrical stopping. Shutdown still does not join the adjustment task; ordered shutdown and last-handle cleanup are later checkpoints.
 
+### Exhaustive stopping (0.1.4)
+
+The default `MotorDriver::stop_all()` attempts M1–M4 in order even if an earlier stop fails. `Pca9685MotorBoard::stop_motor()` similarly attempts all six writes: reference-channel on/off, forward-channel on/off, then backward-channel on/off, all with value zero. The healthy-board write sequence and electrical behavior are unchanged.
+
+Failures are collected into the existing `MotorError::Pwm` variant. Messages identify every failed motor and retain its diagnostic; PCA9685 write failures also identify the channel and operation. A returned error means actual output is uncertain even though the remaining stops were attempted. Custom drivers overriding `stop_all()` must implement their own exhaustive stopping behavior.
+
+`Robot::stop()` still accepts a smooth ramp to zero; it does not report subsequent hardware failures. `Robot::shutdown()` still logs stop failures and retains its existing return type and task-ordering limitations. This release improves stop attempts without adding a new shutdown or fault-status API.
+
+## Examples
+
 ### Web Server Example
 
-The repository includes a full web server example (`examples/web_server.rs`) with a dual-joystick UI:
+The repository includes a full web server example (`examples/web_server.rs`) with a dual-joystick UI. It uses left M4/right M1 with both motor factors defaulting to +1:
 
 ```bash
 # Start with default settings (binds to 0.0.0.0:8000)
@@ -158,7 +171,7 @@ cargo run --example test --features pca9685
 
 ### Controller verification on hardware
 
-`controller_check` exercises `Robot`, unlike the raw M1–M4 motor test. It defaults to left M1/right M4, factors +1, and power 0.25. Keep the tracks clear of the surface, use a power that moves your motors safely, and keep a power cutoff accessible. Stop any other process controlling the board first.
+`controller_check` exercises `Robot`, unlike the raw M1–M4 motor test. It defaults to left M4/right M1, factors +1, and power 0.25. Keep the tracks clear of the surface, use a power that moves your motors safely, and keep a power cutoff accessible. Stop any other process controlling the motor board first.
 
 ```bash
 cargo run --example controller_check --features pca9685 -- --power 0.25
@@ -179,11 +192,21 @@ After the baseline, expect six additional `paired targets / ...` stages: forward
 Check configuration rejection separately:
 
 ```bash
-cargo run --example controller_check --features pca9685 -- --right-motor 1
+cargo run --example controller_check --features pca9685 -- --right-motor 4
 cargo run --example controller_check --features pca9685 -- --interval-ms 0
 ```
 
 Both should print `Controller rejected configuration`, exit with an error and never begin the motion sequence. The example opens and stops the board before creating the controller, so these are not tests of hardware-free startup. Use `--i2c-bus /dev/i2c-1 --i2c-addr 96` to override the connection and `--left-motor`/`--right-motor` to match your wiring. Avoid large factors on hardware: they can saturate at full power; mock tests cover those extremes.
+
+For v0.1.4 stopping verification, repeat the baseline with the corrected left M4/right M1 assignment and the same factors and modest power used for the accepted v0.1.3 run:
+
+```bash
+cargo run --example controller_check --features pca9685 -- --power 0.25
+```
+
+Observe the `forward → zero` and `reverse → zero` stages: the configured pair should return to the same zero-output behavior as v0.1.3. Expect the invalid-input rejection message and final `Shutdown requested` message, with no driver warnings on healthy hardware. Verify all connected ports remain off after shutdown. The raw full-speed M1–M4 test is optional and appropriate only for independently connected motors whose mechanism permits that sequence.
+
+Record version, board/bus/address, wiring, factors, requested power, observed stopping times and pass/fail results. End the test with the power cutoff and investigate unexpected direction, loss of control, driver errors or motion after shutdown. Inject bus faults only in the automated mocks; do not unplug powered motor wiring. These observations supplement the tests and do not establish mechanical standstill or repair the existing shutdown race.
 
 
 ## Feature Flags
