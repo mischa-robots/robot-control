@@ -1,7 +1,7 @@
 //! Bounded, operator-run checks through Robot (not direct motor commands).
 use std::{sync::Arc, time::Duration};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use robot_control::{Motor, MotorDriver, Pca9685MotorBoard, Robot, RobotConfig, RobotError};
 use tokio::sync::Mutex;
 
@@ -32,6 +32,16 @@ struct Cli {
     /// Append alternating forward/pivot commands to check paired target changes.
     #[arg(long)]
     paired_targets: bool,
+    /// After the baseline, check shutdown from motion or last-handle drop.
+    #[arg(long, value_enum)]
+    lifecycle_check: Option<LifecycleCheck>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum LifecycleCheck {
+    Forward,
+    Reverse,
+    Drop,
 }
 
 fn motor(number: u8) -> Motor {
@@ -102,6 +112,45 @@ async fn interrupted() -> std::io::Result<()> {
     tokio::signal::ctrl_c().await
 }
 
+async fn lifecycle_check(
+    robot: Arc<Robot>,
+    power: f32,
+    check: LifecycleCheck,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let demand = if matches!(check, LifecycleCheck::Reverse) {
+        -power
+    } else {
+        power
+    };
+    println!("Lifecycle check: left={demand}, right={demand} for one second including ramp");
+    let result: Result<bool, Box<dyn std::error::Error>> = tokio::select! {
+        result = async {
+            robot.drive(demand, demand).await?;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Ok::<_, RobotError>(true)
+        } => result.map_err(Into::into),
+        result = interrupted() => result.map(|()| false).map_err(Into::into),
+    };
+    if matches!(result, Ok(true)) && matches!(check, LifecycleCheck::Drop) {
+        // Consume the only public handle. The caller retains the motor driver,
+        // proving this check does not depend on the board itself being dropped.
+        drop(robot);
+        println!(
+            "Last Robot handle dropped; observing best-effort cleanup for two seconds with the runtime alive."
+        );
+    } else {
+        // Also await cleanup on an error or signal during the motion stage.
+        robot.shutdown().await;
+        robot.shutdown().await;
+        println!(
+            "Shutdown completed twice; observing outputs for two seconds. Check driver warnings."
+        );
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    println!("Observation window finished; confirm outputs stayed off.");
+    result.map(|_| ())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -128,11 +177,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(error.into());
         }
     };
-    let result: Result<(), Box<dyn std::error::Error>> = tokio::select! {
-        result = sequence(&robot, cli.power, cli.paired_targets) => result.map_err(Into::into),
-        result = interrupted() => result.map_err(Into::into),
+    let result: Result<bool, Box<dyn std::error::Error>> = tokio::select! {
+        result = sequence(&robot, cli.power, cli.paired_targets) => result.map(|()| true).map_err(Into::into),
+        result = interrupted() => result.map(|()| false).map_err(Into::into),
     };
+    // A signal ending the baseline must not start a new motion check.
+    if matches!(result, Ok(true)) {
+        if let Some(check) = cli.lifecycle_check {
+            return lifecycle_check(robot, cli.power, check).await;
+        }
+    }
     robot.shutdown().await;
-    println!("Shutdown requested; inspect the robot and any driver warnings.");
-    result
+    println!("Shutdown completed; inspect the robot and any driver warnings.");
+    result.map(|_| ())
 }

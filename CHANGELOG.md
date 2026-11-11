@@ -7,6 +7,22 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## Unreleased
 
+## 0.1.5
+
+### Fixed
+
+- Close command admission, cancel and join the adjustment task, then perform the final exhaustive stop. No adjustment writes occur after awaited `shutdown` returns.
+- Share one cleanup task across repeated/concurrent shutdown calls. Cancelling an awaiter leaves cleanup running and retains the join handle for other callers.
+- Remove the background task's ownership of `Arc<Robot>`. Dropping the last public handle requests cancellation and best-effort asynchronous cleanup even when an external driver reference survives.
+- Correct shutdown/drop documentation: explicit awaited shutdown establishes task and cleanup completion; stop failures are logged through the existing `()` API. Drop requires a live runtime and does not synchronously finish hardware I/O.
+
+### Added
+
+- Mock lifecycle tests with blocked driver writes/stops covering ordered cleanup, command rejection, concurrent/repeated shutdown, cancelled awaiters, last-handle drop, surviving driver references and stop failures.
+- `controller_check --lifecycle-check forward|reverse|drop` and operator instructions for bounded motion followed by shutdown/drop and a live-runtime observation window.
+
+Public signatures, error variants, ramping and electrical behavior remain unchanged. Examples retain left M4/right M1 and +1 factors.
+
 ## 0.1.4
 
 ### Fixed
