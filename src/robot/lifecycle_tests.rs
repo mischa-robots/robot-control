@@ -60,6 +60,10 @@ struct TestDriver {
     cleanup_gate: Option<Arc<Gate>>,
     cleanup_finished: Arc<Notify>,
     fail_stop: bool,
+    fail_write: Option<Motor>,
+    fail_zero_stop: bool,
+    failure_detail: Option<String>,
+    panic_write: bool,
 }
 
 impl MotorDriver for TestDriver {
@@ -71,13 +75,27 @@ impl MotorDriver for TestDriver {
             .lock()
             .unwrap()
             .push(Event::Speed(motor, speed, forward));
+        assert!(!self.panic_write, "injected adjustment panic");
+        if self.fail_write == Some(motor) {
+            return Err(MotorError::I2c(
+                self.failure_detail
+                    .clone()
+                    .unwrap_or_else(|| "injected write failure".into()),
+            ));
+        }
         Ok(())
     }
 
     fn stop_motor(&self, motor: Motor) -> Result<(), MotorError> {
         self.events.lock().unwrap().push(Event::StopAttempt(motor));
-        if self.fail_stop && motor == Motor::Motor2 {
-            Err(MotorError::I2c("injected stop failure".into()))
+        if (self.fail_stop && motor == Motor::Motor2)
+            || (self.fail_zero_stop && motor == Motor::Motor4)
+        {
+            Err(MotorError::I2c(
+                self.failure_detail
+                    .clone()
+                    .unwrap_or_else(|| "injected stop failure".into()),
+            ))
         } else {
             Ok(())
         }
@@ -324,9 +342,294 @@ async fn stop_failure_does_not_prevent_cleanup_completion() {
         assert_final_cleanup(&events.lock().unwrap());
         assert!(matches!(
             robot.drive(0.5, 0.5).await,
-            Err(RobotError::Shutdown)
+            Err(RobotError::Motor(MotorError::Pwm(message))) if message.contains("injected stop failure")
         ));
+        let status = robot.status().await;
+        assert_eq!(status.phase, RobotPhase::Faulted);
+        assert_eq!(status.output, RobotOutputState::Unknown);
+        assert!(status.cleanup_complete);
+        assert!(status.fault.is_none());
+        assert!(status.cleanup_error.unwrap().contains("injected stop failure"));
     })
     .await
     .expect("stop failure prevented shutdown completion");
+}
+
+#[tokio::test(start_paused = true)]
+async fn left_and_right_failures_latch_and_stop_without_later_drive_writes() {
+    for (motor, side, attempted) in [(Motor::Motor4, "left", 1), (Motor::Motor1, "right", 2)] {
+        for fail_stop in [false, true] {
+            let driver = TestDriver {
+                fail_write: Some(motor),
+                fail_stop,
+                ..TestDriver::default()
+            };
+            let events = driver.events.clone();
+            let finished = driver.cleanup_finished.clone();
+            let (robot, _driver) = create_robot(driver);
+            assert_eq!(robot.status().await.phase, RobotPhase::Running);
+            robot.drive(0.25, -0.25).await.unwrap();
+            // Acceptance has not performed any hardware I/O or confirmed zero.
+            assert!(events.lock().unwrap().is_empty());
+            assert_eq!(robot.status().await.output, RobotOutputState::Unknown);
+            tokio::time::timeout(Duration::from_secs(5), finished.notified())
+                .await
+                .unwrap();
+            robot.shutdown().await;
+            let status = robot.status().await;
+            assert_eq!(status.phase, RobotPhase::Faulted);
+            assert!(status.cleanup_complete);
+            assert!(
+                status
+                    .fault
+                    .as_ref()
+                    .unwrap()
+                    .contains(&format!("{side} motor {motor:?}"))
+            );
+            assert!(
+                status
+                    .fault
+                    .as_ref()
+                    .unwrap()
+                    .contains("injected write failure")
+            );
+            assert_eq!(status.cleanup_error.is_some(), fail_stop);
+            assert_eq!(
+                status.output,
+                if fail_stop {
+                    RobotOutputState::Unknown
+                } else {
+                    RobotOutputState::Stopped
+                }
+            );
+            assert_eq!(robot.state.control.lock().await.targets, (0.0, 0.0));
+            for _ in 0..3 {
+                assert!(matches!(robot.drive(0.5, 0.5).await,
+                    Err(RobotError::Motor(MotorError::Pwm(message))) if message.contains("injected write failure")));
+                assert!(matches!(
+                    robot.stop().await,
+                    Err(RobotError::Motor(MotorError::Pwm(_)))
+                ));
+                robot.shutdown().await;
+                assert_eq!(robot.status().await, status);
+            }
+            let completed = events.lock().unwrap().clone();
+            assert_eq!(
+                completed
+                    .iter()
+                    .filter(|event| matches!(event, Event::Speed(..)))
+                    .count(),
+                attempted
+            );
+            assert_final_cleanup(&completed);
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(*events.lock().unwrap(), completed);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fault_clears_pending_targets_and_rejects_waiters_while_cleanup_is_blocked() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let write = Arc::new(Gate::default());
+        let cleanup = Arc::new(Gate::default());
+        let _release_write = ReleaseOnDrop(write.clone());
+        let _release_cleanup = ReleaseOnDrop(cleanup.clone());
+        let driver = TestDriver {
+            write_gate: Some(write.clone()),
+            cleanup_gate: Some(cleanup.clone()),
+            fail_write: Some(Motor::Motor4),
+            ..TestDriver::default()
+        };
+        let events = driver.events.clone();
+        let (robot, _driver) = create_robot(driver);
+        robot.drive(0.25, 0.25).await.unwrap();
+        write.entered.notified().await;
+        // Accepted while the preceding output is in flight; must not survive
+        // that output's failure or get applied after fault cleanup.
+        robot.drive(-0.75, 0.5).await.unwrap();
+        write.release();
+        cleanup.entered.notified().await;
+        let status = robot.status().await;
+        assert_eq!(status.phase, RobotPhase::Faulted);
+        assert_eq!(status.output, RobotOutputState::Unknown);
+        assert!(!status.cleanup_complete);
+        assert!(
+            status
+                .fault
+                .as_ref()
+                .unwrap()
+                .contains("injected write failure")
+        );
+
+        let control = robot.state.control.lock().await;
+        assert_eq!(control.targets, (0.0, 0.0));
+        let mut drive = Box::pin(robot.drive(1.0, -1.0));
+        let mut stop = Box::pin(robot.stop());
+        assert_pending(drive.as_mut()).await;
+        assert_pending(stop.as_mut()).await;
+        drop(control);
+        assert!(matches!(
+            drive.await,
+            Err(RobotError::Motor(MotorError::Pwm(_)))
+        ));
+        assert!(matches!(
+            stop.await,
+            Err(RobotError::Motor(MotorError::Pwm(_)))
+        ));
+        let mut shutdown = Box::pin(robot.shutdown());
+        assert_pending(shutdown.as_mut()).await;
+        drop(shutdown);
+        assert_eq!(robot.status().await, status);
+        cleanup.release();
+        robot.shutdown().await;
+        let finished = robot.status().await;
+        assert_eq!(finished.fault, status.fault);
+        assert_eq!(finished.phase, RobotPhase::Faulted);
+        assert_eq!(finished.output, RobotOutputState::Stopped);
+        assert!(finished.cleanup_complete);
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::Speed(..)))
+                .count(),
+            1
+        );
+        assert_final_cleanup(&events);
+    })
+    .await
+    .expect("fault handling or cleanup deadlocked");
+}
+
+#[tokio::test(start_paused = true)]
+async fn healthy_status_distinguishes_admission_shutdown_and_successful_stop() {
+    let (robot, driver) = create_robot(TestDriver::default());
+    let initial = robot.status().await;
+    assert_eq!(initial.phase, RobotPhase::Running);
+    assert_eq!(initial.output, RobotOutputState::Unknown);
+    assert!(!initial.cleanup_complete);
+    robot.drive(0.25, 0.25).await.unwrap();
+    let board = driver.lock().await;
+    let mut shutdown = Box::pin(robot.shutdown());
+    assert_pending(shutdown.as_mut()).await;
+    let stopping = robot.status().await;
+    assert_eq!(stopping.phase, RobotPhase::ShuttingDown);
+    assert_eq!(stopping.output, RobotOutputState::Unknown);
+    assert!(!stopping.cleanup_complete);
+    drop(board);
+    shutdown.await;
+    let stopped = robot.status().await;
+    assert_eq!(stopped.phase, RobotPhase::Shutdown);
+    assert_eq!(stopped.output, RobotOutputState::Stopped);
+    assert!(stopped.cleanup_complete);
+    assert!(stopped.fault.is_none() && stopped.cleanup_error.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn fault_diagnostics_are_bounded_and_survive_repeated_commands() {
+    let driver = TestDriver {
+        fail_write: Some(Motor::Motor4),
+        fail_stop: true,
+        failure_detail: Some("故障".repeat(5000)),
+        ..TestDriver::default()
+    };
+    let finished = driver.cleanup_finished.clone();
+    let (robot, _driver) = create_robot(driver);
+    robot.drive(0.25, 0.25).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), finished.notified())
+        .await
+        .unwrap();
+    robot.shutdown().await;
+    let status = robot.status().await;
+    for diagnostic in [&status.fault, &status.cleanup_error] {
+        let message = diagnostic.as_ref().unwrap();
+        assert!(message.len() <= 4096);
+        assert!(message.ends_with(" [truncated]"));
+    }
+    for _ in 0..10 {
+        assert!(robot.drive(0.5, 0.5).await.is_err());
+        robot.shutdown().await;
+        assert_eq!(robot.status().await, status);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn adjustment_panic_is_observable_and_cleanup_still_runs() {
+    let driver = TestDriver {
+        panic_write: true,
+        ..TestDriver::default()
+    };
+    let finished = driver.cleanup_finished.clone();
+    let events = driver.events.clone();
+    let (robot, _driver) = create_robot(driver);
+    robot.drive(0.25, 0.25).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), finished.notified())
+        .await
+        .unwrap();
+    robot.shutdown().await;
+    let status = robot.status().await;
+    assert_eq!(status.phase, RobotPhase::Faulted);
+    assert!(status.fault.unwrap().contains("injected adjustment panic"));
+    assert_eq!(status.output, RobotOutputState::Stopped);
+    assert!(status.cleanup_complete);
+    assert_final_cleanup(&events.lock().unwrap());
+}
+
+#[tokio::test(start_paused = true)]
+async fn background_zero_output_failure_also_latches() {
+    let driver = TestDriver {
+        fail_zero_stop: true,
+        ..TestDriver::default()
+    };
+    let finished = driver.cleanup_finished.clone();
+    let events = driver.events.clone();
+    let (robot, _driver) = create_robot(driver);
+    // No nonzero command: the adjustment loop still writes stopped outputs.
+    tokio::time::timeout(Duration::from_secs(5), finished.notified())
+        .await
+        .unwrap();
+    robot.shutdown().await;
+    let status = robot.status().await;
+    assert_eq!(status.phase, RobotPhase::Faulted);
+    assert_eq!(status.output, RobotOutputState::Unknown);
+    assert!(status.fault.unwrap().contains("left motor Motor4"));
+    assert!(
+        status
+            .cleanup_error
+            .unwrap()
+            .contains("injected stop failure")
+    );
+    let events = events.lock().unwrap();
+    assert_eq!(events[0], Event::StopAttempt(Motor::Motor4));
+    assert_final_cleanup(&events);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_flight_failure_is_retained_when_shutdown_already_started() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let gate = Arc::new(Gate::default());
+        let _release = ReleaseOnDrop(gate.clone());
+        let driver = TestDriver {
+            write_gate: Some(gate.clone()),
+            fail_write: Some(Motor::Motor4),
+            ..TestDriver::default()
+        };
+        let (robot, _driver) = create_robot(driver);
+        robot.drive(0.25, 0.25).await.unwrap();
+        gate.entered.notified().await;
+        let mut shutdown = Box::pin(robot.shutdown());
+        assert_pending(shutdown.as_mut()).await;
+        assert_eq!(robot.status().await.phase, RobotPhase::ShuttingDown);
+        gate.release();
+        shutdown.await;
+        let status = robot.status().await;
+        assert_eq!(status.phase, RobotPhase::Faulted);
+        assert_eq!(status.output, RobotOutputState::Stopped);
+        assert!(status.cleanup_complete);
+        assert!(status.fault.unwrap().contains("injected write failure"));
+    })
+    .await
+    .expect("shutdown lost an in-flight fault");
 }

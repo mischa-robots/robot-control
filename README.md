@@ -89,7 +89,7 @@ The public API and defaults are unchanged. To preserve existing error enum match
 
 ### Paired targets (0.1.3)
 
-`drive(left, right)` accepts both targets atomically, and `stop()` atomically replaces the pair with zero. Each adjustment tick reads one complete pair, even when commands run concurrently. Commands waiting behind shutdown recheck admission under the same lock and return `RobotError::Shutdown` without changing targets once cancellation has begun.
+`drive(left, right)` accepts both targets atomically, and `stop()` atomically replaces the pair with zero. Each adjustment tick reads one complete pair, even when commands run concurrently. Commands waiting behind shutdown recheck admission under the same lock and return `RobotError::Shutdown` without changing targets once cancellation has begun, or the retained diagnostic if the controller faulted.
 
 Successful `drive` means target acceptance. Each motor still ramps independently, and the driver writes the left and right outputs sequentially. Paired acceptance does not change ramp timing, polarity, PWM mapping or electrical stopping.
 
@@ -99,15 +99,33 @@ The default `MotorDriver::stop_all()` attempts M1–M4 in order even if an earli
 
 Failures are collected into the existing `MotorError::Pwm` variant. Messages identify every failed motor and retain its diagnostic; PCA9685 write failures also identify the channel and operation. A returned error means actual output is uncertain even though the remaining stops were attempted. Custom drivers overriding `stop_all()` must implement their own exhaustive stopping behavior.
 
-`Robot::stop()` still accepts a smooth ramp to zero; it does not report subsequent hardware failures. `Robot::shutdown()` logs stop failures and retains its existing `()` return type. Exhaustive stopping does not add a fault-status API.
+`Robot::stop()` still accepts a smooth ramp to zero; the call does not confirm subsequent hardware application. `Robot::shutdown()` logs stop failures and retains its existing `()` return type. As of 0.1.6, failures are also visible through `Robot::status()`.
 
 ### Ordered shutdown and task ownership (0.1.5)
 
-`robot.shutdown().await` closes command admission under the paired target lock, requests cancellation, waits for the adjustment task to terminate, and then finishes the final `stop_all()` attempt. New `drive` and `stop` calls return `RobotError::Shutdown` once admission closes. No adjustment writes occur after shutdown returns. In-flight driver I/O must finish first; shutdown does not abort it or wait for a smooth ramp to zero.
+`robot.shutdown().await` closes command admission under the paired target lock, requests cancellation, waits for the adjustment task to terminate, and then finishes the final `stop_all()` attempt. New `drive` and `stop` calls return `RobotError::Shutdown` once admission closes normally; latched faults take precedence and return their diagnostic. No adjustment writes occur after shutdown returns. In-flight driver I/O must finish first; shutdown does not abort it or wait for a smooth ramp to zero.
 
 Repeated and concurrent shutdown calls wait for the same cleanup. Once admission closes, dropping one shutdown future leaves cleanup running and other callers can still await completion. The unchanged `()` result establishes task/cleanup completion, not successful electrical stopping: inspect logged driver errors, and do not infer mechanical standstill from software completion. A blocked driver call can delay shutdown indefinitely.
 
 Background tasks own internal state rather than `Arc<Robot>`. Dropping the last public handle requests cancellation and best-effort asynchronous cleanup while the Tokio runtime stays alive, even if another owner retains the motor driver. Dropping one of several handles leaves the controller running. `Drop` performs no synchronous motor I/O and cannot guarantee cleanup after runtime destruction, process termination or power failure. Explicit awaited shutdown is the supported completion path.
+
+### Latched faults and status (0.1.6)
+
+A background output failure now closes command admission, clears both pending targets and ends adjustment before the existing exhaustive cleanup runs. This includes failures writing a zero output. If the left write fails, the right drive write is skipped. A previously accepted or waiting command cannot restart motion after the fault latches. Subsequent `drive` and `stop` calls return `RobotError::Motor(MotorError::Pwm(...))` containing the retained diagnostic. After cleanup, investigate the fault and create a fresh `Robot` to resume; repeated shutdown does not reset a fault or retry cleanup.
+
+`robot.status().await` returns a snapshot without hardware I/O:
+
+| Field | Meaning |
+| --- | --- |
+| `phase` | `Running`, `ShuttingDown`, `Shutdown` or latched `Faulted` |
+| `output` | `Unknown` until the final `stop_all()` succeeds; `Stopped` afterward |
+| `fault` | First background output/task failure, retained after shutdown |
+| `cleanup_error` | Final stop failure, stored separately from the original fault |
+| `cleanup_complete` | Cleanup finished, even when its stop attempt failed |
+
+The two optional diagnostics each retain at most 4096 UTF-8 bytes, including a truncation marker if needed. Rejected commands do not grow an error history. The new types are exported as `RobotStatus`, `RobotPhase` and `RobotOutputState`; existing error enums and config fields are unchanged.
+
+`Running` means commands are accepted, not that hardware passed a self-test. `drive().await` confirms target acceptance only. While running, output status remains conservatively `Unknown`, even at a zero target. `Stopped` means the final driver stop returned success; it is not sensor feedback or proof of mechanical standstill and cannot account for writes through external driver references. Successful fault cleanup therefore reports `Faulted` with `Stopped`; failed cleanup reports `Faulted` with `Unknown`. Use awaited shutdown to join cleanup, then inspect status.
 
 ## Examples
 
@@ -225,6 +243,23 @@ cargo run --example controller_check --features pca9685 -- --power 0.25
 ```
 
 Each lifecycle run first performs the baseline, then commands the selected direction for one second including ramp. Forward/reverse modes await shutdown twice and print `Shutdown completed twice`, then keep the process alive for two seconds: outputs should remain off. Drop mode commands forward, drops the only public robot handle, and prints `Last Robot handle dropped`; the runtime and an external motor-driver reference stay alive during the two-second observation window. This tests asynchronous drop cleanup independently of process exit or board destruction. The drop observation window is not a cleanup acknowledgement or a guaranteed stopping deadline. Each run takes roughly 12 seconds under normal conditions; blocked I/O can extend it.
+
+For v0.1.6, repeat the baseline with the accepted v0.1.5 wiring, factors and modest power:
+
+```bash
+cargo run --example controller_check --features pca9685 -- --power 0.25
+```
+
+The example prints status at startup, after each baseline stage and after explicit shutdown. On healthy hardware, expect `Running` with `Unknown` during the sequence, then `Shutdown`, `Stopped`, `cleanup_complete: true`, and no fault/cleanup diagnostic after shutdown. Motion and stopping should match v0.1.5. A successful accepted command is not reported as verified hardware motion.
+
+Demonstrate fault reporting on the robot host without accessing hardware:
+
+```bash
+cargo run --example fault_check --no-default-features
+cargo run --example fault_check --no-default-features -- --cleanup-failure
+```
+
+Both runs accept one target, inject a mock left M4 output failure, print stop attempts for M1–M4 and reject a later drive command. The first ends with `Faulted`/`Stopped`; the second retains both output and cleanup diagnostics and ends with `Faulted`/`Unknown`. Both report cleanup complete and keep the fault after repeated shutdown. The mock run normally finishes in under a second and has a two-second failure-notification guard. No bus disconnection or live wiring fault is needed.
 
 Record version, board/bus/address, wiring, factors, requested power, observed stopping times and pass/fail results. End the test with the power cutoff and investigate unexpected direction, loss of control, driver errors or motion after shutdown. Inject bus faults only in the automated mocks; do not unplug powered motor wiring. These observations supplement the mock race tests and do not establish mechanical standstill.
 

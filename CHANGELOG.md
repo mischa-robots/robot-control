@@ -7,6 +7,21 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## Unreleased
 
+## 0.1.6
+
+### Fixed
+
+- Latch the first background motor-write failure, clear both pending targets, close command admission and run the existing joined, exhaustive cleanup. A failed left write skips the right drive write; neither motor receives later adjustment writes after a fault.
+- Preserve background and final-stop diagnostics across cleanup and repeated shutdown. Faulted `drive`/`stop` calls return the existing `RobotError::Motor(MotorError::Pwm(...))` with diagnostic context; recovery requires a fresh robot after cleanup.
+
+### Added
+
+- `Robot::status()` and the additive `RobotStatus`, `RobotPhase` and `RobotOutputState` types. Snapshots expose lifecycle, cleanup completion, the first background failure and final cleanup failure, with each diagnostic bounded to 4096 UTF-8 bytes. Output remains `Unknown` until a final stop succeeds; `Stopped` means driver-reported success, not measured standstill.
+- Mock regression coverage for left/right and zero-output failures, queued commands, shutdown/fault races, cleanup failure, adjustment-task panic, persistent faults and bounded diagnostics.
+- Hardware-check status output and a hardware-free `fault_check` example, including an optional cleanup failure.
+
+Existing public signatures, config literals and error variants remain compatible. Ramping, electrical behavior and left M4/right M1 example wiring are preserved. Hardware acceptance is pending operator testing.
+
 ## 0.1.5
 
 ### Fixed

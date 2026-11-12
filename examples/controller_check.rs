@@ -67,6 +67,7 @@ async fn sequence(robot: &Robot, power: f32, paired_targets: bool) -> Result<(),
         println!("{name}: left={left}, right={right} (one second including ramp)");
         robot.drive(left, right).await?;
         tokio::time::sleep(Duration::from_secs(1)).await;
+        println!("Controller status: {:?}", robot.status().await);
     }
     if paired_targets {
         for (name, left, right) in [
@@ -142,6 +143,7 @@ async fn lifecycle_check(
         // Also await cleanup on an error or signal during the motion stage.
         robot.shutdown().await;
         robot.shutdown().await;
+        println!("Final controller status: {:?}", robot.status().await);
         println!(
             "Shutdown completed twice; observing outputs for two seconds. Check driver warnings."
         );
@@ -177,6 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(error.into());
         }
     };
+    println!("Initial controller status: {:?}", robot.status().await);
     let result: Result<bool, Box<dyn std::error::Error>> = tokio::select! {
         result = sequence(&robot, cli.power, cli.paired_targets) => result.map(|()| true).map_err(Into::into),
         result = interrupted() => result.map(|()| false).map_err(Into::into),
@@ -188,6 +191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     robot.shutdown().await;
+    println!("Final controller status: {:?}", robot.status().await);
     println!("Shutdown completed; inspect the robot and any driver warnings.");
     result.map(|_| ())
 }

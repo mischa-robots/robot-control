@@ -83,6 +83,77 @@ impl Default for RobotConfig {
     }
 }
 
+/// Controller lifecycle, independent of whether electrical stopping succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RobotPhase {
+    /// Accepting commands; this is not a hardware self-test.
+    Running,
+    /// Admission is closed and adjustment/cleanup is still finishing.
+    ShuttingDown,
+    /// Normal shutdown completed without a reported stop failure.
+    Shutdown,
+    /// A latched task/output/cleanup failure; recovery needs a new robot.
+    Faulted,
+}
+
+/// What the controller can establish about the final output state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RobotOutputState {
+    /// No successful final stop has been established, or stopping failed.
+    /// Also used while running, including immediately after command acceptance.
+    Unknown,
+    /// The final driver `stop_all` returned success. This is not sensor feedback
+    /// or a claim of mechanical standstill, and excludes external driver writes.
+    Stopped,
+}
+
+/// A read-only snapshot obtained from [`Robot::status`].
+///
+/// Keeps the first background failure and final cleanup failure separately.
+/// Each diagnostic is limited to 4096 UTF-8 bytes (with a truncation marker);
+/// repeated rejected commands do not append an error history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RobotStatus {
+    /// Current admission/lifecycle state. Faults remain latched after shutdown.
+    pub phase: RobotPhase,
+    /// Result of the final stop, not a measurement of motor motion.
+    pub output: RobotOutputState,
+    /// First background output or task failure, if one occurred.
+    pub fault: Option<String>,
+    /// Final stop failure, if one occurred.
+    pub cleanup_error: Option<String>,
+    /// Whether cleanup has finished, even if its stop attempt failed.
+    pub cleanup_complete: bool,
+}
+
+struct ControlState {
+    targets: (f32, f32),
+    status: RobotStatus,
+}
+
+impl ControlState {
+    fn check_admission(&self, cancelled: bool) -> Result<(), RobotError> {
+        if let Some(diagnostic) = &self.status.fault {
+            let cleanup = self
+                .status
+                .cleanup_error
+                .as_ref()
+                .map_or(String::new(), |error| format!("; cleanup: {error}"));
+            return Err(MotorError::Pwm(format!("robot faulted: {diagnostic}{cleanup}")).into());
+        }
+        if let Some(diagnostic) = &self.status.cleanup_error {
+            return Err(MotorError::Pwm(format!("robot cleanup failed: {diagnostic}")).into());
+        }
+        if cancelled {
+            return Err(RobotError::Shutdown);
+        }
+        Ok(())
+    }
+}
+
 /// A two-motor differential-drive robot controller.
 ///
 /// The robot smoothly ramps motor speeds from the current value to the target
@@ -92,7 +163,8 @@ impl Default for RobotConfig {
 /// # Shutdown
 ///
 /// Await [`shutdown`](Robot::shutdown) to close command admission, join the
-/// adjustment task and finish the final stop attempt. Stop failures are logged.
+/// adjustment task and finish the final stop attempt. Stop failures are logged
+/// and retained in [`status`](Robot::status).
 /// Dropping the last public handle requests best-effort asynchronous cleanup
 /// while the Tokio runtime remains alive; it does not wait for motor I/O.
 pub struct Robot {
@@ -107,7 +179,7 @@ struct RobotState {
     motor_board: Arc<Mutex<dyn MotorDriver>>,
     // Serializes paired target updates/snapshots and command admission with
     // shutdown cancellation. Never hold this lock during driver I/O.
-    target_speeds: Mutex<(f32, f32)>,
+    control: Mutex<ControlState>,
     config: RobotConfig,
     cancel_token: CancellationToken,
 }
@@ -132,7 +204,16 @@ impl Robot {
         let cancel_token = CancellationToken::new();
         let state = Arc::new(RobotState {
             motor_board,
-            target_speeds: Mutex::new((0.0, 0.0)),
+            control: Mutex::new(ControlState {
+                targets: (0.0, 0.0),
+                status: RobotStatus {
+                    phase: RobotPhase::Running,
+                    output: RobotOutputState::Unknown,
+                    fault: None,
+                    cleanup_error: None,
+                    cleanup_complete: false,
+                },
+            }),
             config,
             cancel_token,
         });
@@ -141,13 +222,14 @@ impl Robot {
         let cleanup_state = state.clone();
         let cleanup = tokio::spawn(async move {
             if let Err(error) = adjustment.await {
-                warn!("motor adjustment task failed: {error}");
+                cleanup_state
+                    .latch_fault(format!("motor adjustment task failed: {error}"))
+                    .await;
             }
             // Also close admission if adjustment terminated unexpectedly.
             cleanup_state.close_admission().await;
-            if let Err(error) = cleanup_state.motor_board.lock().await.stop_all() {
-                warn!("failed to stop motors during shutdown: {error}");
-            }
+            let result = cleanup_state.motor_board.lock().await.stop_all();
+            cleanup_state.finish_cleanup(result).await;
         });
         let robot = Arc::new(Self {
             state,
@@ -169,14 +251,14 @@ impl Robot {
     ///
     /// # Errors
     ///
-    /// Returns [`RobotError::Shutdown`] if the robot has been shut down.
+    /// Returns [`RobotError::Shutdown`] if admission closed without a fault.
+    /// A latched failure returns [`RobotError::Motor`] wrapping [`MotorError::Pwm`]
+    /// with the retained diagnostic; it takes precedence over shutdown.
     /// Returns [`RobotError::Motor`] wrapping [`MotorError::Pwm`] for a non-finite
     /// input, retaining the existing error API.
     pub async fn drive(&self, left: f32, right: f32) -> Result<(), RobotError> {
-        let mut targets = self.state.target_speeds.lock().await;
-        if self.state.cancel_token.is_cancelled() {
-            return Err(RobotError::Shutdown);
-        }
+        let mut control = self.state.control.lock().await;
+        control.check_admission(self.state.cancel_token.is_cancelled())?;
 
         if !left.is_finite() || !right.is_finite() {
             return Err(MotorError::Pwm(
@@ -188,8 +270,8 @@ impl Robot {
         let left = scaled_demand(left, self.state.config.left_motor_factor);
         let right = scaled_demand(right, self.state.config.right_motor_factor);
 
-        *targets = (left, right);
-        drop(targets);
+        control.targets = (left, right);
+        drop(control);
 
         debug!(left, right, "drive target set");
         Ok(())
@@ -199,18 +281,26 @@ impl Robot {
     ///
     /// # Errors
     ///
-    /// Returns [`RobotError::Shutdown`] if the robot has been shut down.
+    /// Returns [`RobotError::Shutdown`] after normal admission closure, or
+    /// [`RobotError::Motor`] wrapping [`MotorError::Pwm`] with a latched failure.
     pub async fn stop(&self) -> Result<(), RobotError> {
-        let mut targets = self.state.target_speeds.lock().await;
-        if self.state.cancel_token.is_cancelled() {
-            return Err(RobotError::Shutdown);
-        }
+        let mut control = self.state.control.lock().await;
+        control.check_admission(self.state.cancel_token.is_cancelled())?;
 
-        *targets = (0.0, 0.0);
-        drop(targets);
+        control.targets = (0.0, 0.0);
+        drop(control);
 
         debug!("stop requested");
         Ok(())
+    }
+
+    /// Read a consistent snapshot of lifecycle, output certainty and failures.
+    ///
+    /// Does not perform I/O. A successful drive accepts targets only; it does
+    /// not confirm hardware application. A fault stays visible after cleanup
+    /// and explicit shutdown, even when the final stop succeeds.
+    pub async fn status(&self) -> RobotStatus {
+        self.state.control.lock().await.status.clone()
     }
 
     /// Close command admission, join adjustment, then finish the final stop attempt.
@@ -219,7 +309,8 @@ impl Robot {
     /// dropping a shutdown future does not cancel cleanup. No adjustment writes
     /// occur after this method returns. It does not ramp down before stopping.
     ///
-    /// Stop/task failures are logged; the legacy `()` return value does not
+    /// Driver failures are logged and retained in [`status`](Self::status);
+    /// the legacy `()` return value does not
     /// confirm electrical stopping or mechanical standstill. An in-flight driver
     /// operation must finish before cleanup can proceed; blocked I/O can delay
     /// shutdown indefinitely. The Tokio runtime must remain alive for cleanup.
@@ -251,8 +342,43 @@ impl Drop for Robot {
 impl RobotState {
     async fn close_admission(&self) {
         // Serialize with both command validation and paired target replacement.
-        let _targets = self.target_speeds.lock().await;
+        let mut control = self.control.lock().await;
+        if control.status.phase == RobotPhase::Running {
+            control.status.phase = RobotPhase::ShuttingDown;
+        }
         self.cancel_token.cancel();
+    }
+
+    async fn latch_fault(&self, diagnostic: String) {
+        warn!("{diagnostic}");
+        let mut control = self.control.lock().await;
+        if control.status.fault.is_none() {
+            control.status.fault = Some(bounded_diagnostic(diagnostic));
+        }
+        control.targets = (0.0, 0.0);
+        control.status.phase = RobotPhase::Faulted;
+        control.status.output = RobotOutputState::Unknown;
+        self.cancel_token.cancel();
+    }
+
+    async fn finish_cleanup(&self, result: Result<(), MotorError>) {
+        let mut control = self.control.lock().await;
+        match result {
+            Ok(()) => {
+                control.status.output = RobotOutputState::Stopped;
+                if control.status.phase != RobotPhase::Faulted {
+                    control.status.phase = RobotPhase::Shutdown;
+                }
+            }
+            Err(error) => {
+                warn!("failed to stop motors during shutdown: {error}");
+                control.targets = (0.0, 0.0);
+                control.status.cleanup_error = Some(bounded_diagnostic(error.to_string()));
+                control.status.phase = RobotPhase::Faulted;
+                control.status.output = RobotOutputState::Unknown;
+            }
+        }
+        control.status.cleanup_complete = true;
     }
 
     async fn smooth_motor_adjustment(self: Arc<Self>) {
@@ -271,7 +397,7 @@ impl RobotState {
                 () = tokio::time::sleep(interval) => {}
             }
 
-            let (target_left, target_right) = *self.target_speeds.lock().await;
+            let (target_left, target_right) = self.control.lock().await.targets;
 
             current_left_speed = ramp_toward(current_left_speed, target_left, step);
             current_right_speed = ramp_toward(current_right_speed, target_right, step);
@@ -291,7 +417,10 @@ impl RobotState {
                 left_pwm,
                 current_left_speed,
             ) {
-                warn!("left motor error: {e}");
+                drop(motor_board);
+                self.latch_fault(format!("left motor {:?}: {e}", self.config.left_motor))
+                    .await;
+                break;
             }
 
             if let Err(e) = apply_motor_speed(
@@ -300,10 +429,28 @@ impl RobotState {
                 right_pwm,
                 current_right_speed,
             ) {
-                warn!("right motor error: {e}");
+                drop(motor_board);
+                self.latch_fault(format!("right motor {:?}: {e}", self.config.right_motor))
+                    .await;
+                break;
             }
         }
     }
+}
+
+fn bounded_diagnostic(mut diagnostic: String) -> String {
+    const LIMIT: usize = 4096;
+    const MARKER: &str = " [truncated]";
+    if diagnostic.len() > LIMIT {
+        let mut end = LIMIT - MARKER.len();
+        while !diagnostic.is_char_boundary(end) {
+            end -= 1;
+        }
+        diagnostic.truncate(end);
+        diagnostic.push_str(MARKER);
+        diagnostic.shrink_to_fit();
+    }
+    diagnostic
 }
 
 /// Inputs and factors have been validated; clamp before and after scaling.
@@ -448,7 +595,7 @@ mod tests {
                     robot.drive(left, right).await,
                     Err(RobotError::Motor(MotorError::Pwm(_)))
                 ));
-                assert_eq!(*robot.state.target_speeds.lock().await, (0.25, -0.5));
+                assert_eq!(robot.state.control.lock().await.targets, (0.25, -0.5));
             }
         }
         robot.shutdown().await;
@@ -475,7 +622,7 @@ mod tests {
             let robot = Robot::new(driver, config).unwrap();
             robot.drive(input, input).await.unwrap();
             assert_eq!(
-                *robot.state.target_speeds.lock().await,
+                robot.state.control.lock().await.targets,
                 (expected, expected)
             );
             robot.shutdown().await;
@@ -548,7 +695,7 @@ mod tests {
 
         robot.drive(2.0, -3.0).await.unwrap();
 
-        let (left, right) = *robot.state.target_speeds.lock().await;
+        let (left, right) = robot.state.control.lock().await.targets;
 
         // With default factors (1.0, 1.0), clamped to [-1.0, 1.0]
         assert!((left - 1.0).abs() < f32::EPSILON);
@@ -565,7 +712,7 @@ mod tests {
         robot.drive(0.5, 0.5).await.unwrap();
         robot.stop().await.unwrap();
 
-        let (left, right) = *robot.state.target_speeds.lock().await;
+        let (left, right) = robot.state.control.lock().await.targets;
 
         assert!((left).abs() < f32::EPSILON);
         assert!((right).abs() < f32::EPSILON);
@@ -593,7 +740,7 @@ mod tests {
                             Some((left, right)) => robot.drive(left, right).await.unwrap(),
                             None => robot.stop().await.unwrap(),
                         }
-                        let snapshot = *robot.state.target_speeds.lock().await;
+                        let snapshot = robot.state.control.lock().await.targets;
                         assert!(
                             accepted_pairs.contains(&snapshot),
                             "mixed pair: {snapshot:?}"
@@ -607,13 +754,13 @@ mod tests {
             // all three have completed. No ordering between writers is assumed.
             for _ in 0..128 {
                 barrier.wait().await;
-                let snapshot = *robot.state.target_speeds.lock().await;
+                let snapshot = robot.state.control.lock().await.targets;
                 assert!(
                     accepted_pairs.contains(&snapshot),
                     "mixed pair: {snapshot:?}"
                 );
                 barrier.wait().await;
-                assert!(accepted_pairs.contains(&*robot.state.target_speeds.lock().await));
+                assert!(accepted_pairs.contains(&robot.state.control.lock().await.targets));
             }
             while let Some(result) = writers.join_next().await {
                 result.unwrap();
@@ -639,7 +786,7 @@ mod tests {
             let driver = Arc::new(Mutex::new(MockMotorDriver::new()));
             let robot = Robot::new(driver.clone(), RobotConfig::default()).unwrap();
             robot.drive(0.25, -0.5).await.unwrap();
-            let targets = robot.state.target_speeds.lock().await;
+            let targets = robot.state.control.lock().await;
             // Hold I/O too: admission must close before shutdown can stop the
             // board, without keeping the target lock held during that I/O wait.
             let board = driver.lock().await;
@@ -660,7 +807,7 @@ mod tests {
             assert!(robot.state.cancel_token.is_cancelled());
             assert!(matches!(drive.await, Err(RobotError::Shutdown)));
             assert!(matches!(stop.await, Err(RobotError::Shutdown)));
-            assert_eq!(*robot.state.target_speeds.lock().await, (0.25, -0.5));
+            assert_eq!(robot.state.control.lock().await.targets, (0.25, -0.5));
             drop(board);
             shutdown.await;
         })
@@ -725,7 +872,7 @@ mod tests {
 
         robot.drive(0.5, 0.5).await.unwrap();
 
-        let (left, right) = *robot.state.target_speeds.lock().await;
+        let (left, right) = robot.state.control.lock().await.targets;
 
         // Left factor is -1.0, so 0.5 * -1.0 = -0.5
         assert!((left - (-0.5)).abs() < f32::EPSILON);
