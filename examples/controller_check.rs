@@ -1,8 +1,13 @@
 //! Bounded, operator-run checks through Robot (not direct motor commands).
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use clap::{Parser, ValueEnum};
-use robot_control::{Motor, MotorDriver, Pca9685MotorBoard, Robot, RobotConfig, RobotError};
+use robot_control::{
+    Motor, MotorDriver, MotorError, Pca9685MotorBoard, Robot, RobotConfig, RobotError,
+};
 use tokio::sync::Mutex;
 
 #[derive(Parser)]
@@ -24,8 +29,15 @@ struct Cli {
     left_factor: f32,
     #[arg(long, default_value_t = 1.0, allow_hyphen_values = true)]
     right_factor: f32,
+    /// Adjustment interval in milliseconds (10..=20 for this example).
     #[arg(long, default_value_t = 10)]
     interval_ms: u64,
+    /// Nominal power change per interval (0.01..=0.1 for this example).
+    #[arg(long, default_value_t = 0.1, allow_hyphen_values = true)]
+    adjustment_step: f32,
+    /// Print timestamped output writes (PWM demand, not measured wheel speed).
+    #[arg(long)]
+    trace_output: bool,
     /// Finite requested power in (0, 1]; factors are applied afterward.
     #[arg(long, default_value_t = 0.25)]
     power: f32,
@@ -44,6 +56,33 @@ enum LifecycleCheck {
     Drop,
 }
 
+struct TracedBoard {
+    board: Pca9685MotorBoard,
+    started: Instant,
+}
+
+impl MotorDriver for TracedBoard {
+    fn set_motor_speed(&self, motor: Motor, speed: u16, forward: bool) -> Result<(), MotorError> {
+        let result = self.board.set_motor_speed(motor, speed, forward);
+        println!(
+            "output t={:.6}s motor={motor:?} pwm={speed} forward={forward} ok={}",
+            self.started.elapsed().as_secs_f64(),
+            result.is_ok()
+        );
+        result
+    }
+
+    fn stop_motor(&self, motor: Motor) -> Result<(), MotorError> {
+        let result = self.board.stop_motor(motor);
+        println!(
+            "output t={:.6}s motor={motor:?} pwm=0 stop ok={}",
+            self.started.elapsed().as_secs_f64(),
+            result.is_ok()
+        );
+        result
+    }
+}
+
 fn motor(number: u8) -> Motor {
     match number {
         1 => Motor::Motor1,
@@ -53,7 +92,12 @@ fn motor(number: u8) -> Motor {
     }
 }
 
-async fn sequence(robot: &Robot, power: f32, paired_targets: bool) -> Result<(), RobotError> {
+async fn sequence(
+    robot: &Robot,
+    power: f32,
+    paired_targets: bool,
+    started: Instant,
+) -> Result<(), RobotError> {
     for (name, left, right) in [
         ("zero", 0.0, 0.0),
         ("left only", power, 0.0),
@@ -64,7 +108,10 @@ async fn sequence(robot: &Robot, power: f32, paired_targets: bool) -> Result<(),
         ("reverse", -power, -power),
         ("zero", 0.0, 0.0),
     ] {
-        println!("{name}: left={left}, right={right} (one second including ramp)");
+        println!(
+            "{name}: left={left}, right={right} at t={:.6}s (one second including ramp)",
+            started.elapsed().as_secs_f64()
+        );
         robot.drive(left, right).await?;
         tokio::time::sleep(Duration::from_secs(1)).await;
         println!("Controller status: {:?}", robot.status().await);
@@ -79,7 +126,8 @@ async fn sequence(robot: &Robot, power: f32, paired_targets: bool) -> Result<(),
             ("zero", 0.0, 0.0),
         ] {
             println!(
-                "paired targets / {name}: left={left}, right={right} (one second including ramp)"
+                "paired targets / {name}: left={left}, right={right} at t={:.6}s (one second including ramp)",
+                started.elapsed().as_secs_f64()
             );
             robot.drive(left, right).await?;
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -117,13 +165,17 @@ async fn lifecycle_check(
     robot: Arc<Robot>,
     power: f32,
     check: LifecycleCheck,
+    started: Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let demand = if matches!(check, LifecycleCheck::Reverse) {
         -power
     } else {
         power
     };
-    println!("Lifecycle check: left={demand}, right={demand} for one second including ramp");
+    println!(
+        "Lifecycle check: left={demand}, right={demand} at t={:.6}s for one second including ramp",
+        started.elapsed().as_secs_f64()
+    );
     let result: Result<bool, Box<dyn std::error::Error>> = tokio::select! {
         result = async {
             robot.drive(demand, demand).await?;
@@ -159,17 +211,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !cli.power.is_finite() || cli.power <= 0.0 || cli.power > 1.0 {
         return Err("--power must be finite and in (0, 1]".into());
     }
+    if !(0.01..=0.1).contains(&cli.adjustment_step) {
+        return Err("--adjustment-step must be finite and in [0.01, 0.1] for this example".into());
+    }
+    if !(10..=20).contains(&cli.interval_ms) {
+        return Err("--interval-ms must be in [10, 20] for this example".into());
+    }
     tracing_subscriber::fmt::init();
     let board = Pca9685MotorBoard::new(&cli.i2c_bus, cli.i2c_addr)?;
     board.stop_all()?;
-    let driver: Arc<Mutex<dyn MotorDriver>> = Arc::new(Mutex::new(board));
+    let started = Instant::now();
+    let driver: Arc<Mutex<dyn MotorDriver>> = if cli.trace_output {
+        Arc::new(Mutex::new(TracedBoard { board, started }))
+    } else {
+        Arc::new(Mutex::new(board))
+    };
     let config = RobotConfig {
         left_motor: motor(cli.left_motor),
         right_motor: motor(cli.right_motor),
         left_motor_factor: cli.left_factor,
         right_motor_factor: cli.right_factor,
         adjustment_interval: Duration::from_millis(cli.interval_ms),
-        ..RobotConfig::default()
+        adjustment_step: cli.adjustment_step,
     };
     let robot = match Robot::new(driver.clone(), config) {
         Ok(robot) => robot,
@@ -181,13 +244,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     println!("Initial controller status: {:?}", robot.status().await);
     let result: Result<bool, Box<dyn std::error::Error>> = tokio::select! {
-        result = sequence(&robot, cli.power, cli.paired_targets) => result.map(|()| true).map_err(Into::into),
+        result = sequence(&robot, cli.power, cli.paired_targets, started) => result.map(|()| true).map_err(Into::into),
         result = interrupted() => result.map(|()| false).map_err(Into::into),
     };
     // A signal ending the baseline must not start a new motion check.
     if matches!(result, Ok(true)) {
         if let Some(check) = cli.lifecycle_check {
-            return lifecycle_check(robot, cli.power, check).await;
+            return lifecycle_check(robot, cli.power, check, started).await;
         }
     }
     robot.shutdown().await;

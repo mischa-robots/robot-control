@@ -7,6 +7,22 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## Unreleased
 
+## 0.1.7
+
+### Fixed
+
+- Advance motor ramps using the configured nominal rate (`adjustment_step / adjustment_interval`) and monotonic elapsed time. Cap elapsed time at one interval so a delayed update never exceeds the existing maximum step.
+- Schedule against the original deadline grid, including driver-lock/I/O delays, and skip missed ticks instead of replaying them or adding a fresh full sleep after each output batch.
+
+### Added
+
+- Bounded `RobotStatus::timing` diagnostics (`RobotTiming`): saturating overrun/skipped-tick counters and last/maximum uncapped update spacing, retained after shutdown.
+- Pure and controlled-time tests covering early/jittered updates, long gaps, stop/reversal, target changes, rate equivalence, bounds, skipped ticks, driver-lock delays and distant-deadline cancellation.
+- `controller_check --adjustment-step` for slower observable ramps and optional `--trace-output` for timestamped output-write results, with a hardware timing procedure.
+- Example-only bounds for `controller_check`: adjustment step 0.01–0.1 and interval 10–20 ms, checked before opening hardware.
+
+Existing config fields, call signatures, 0.1/10 ms defaults, reversal policy, electrical values and left M4/right M1 example wiring are preserved. Delays and the elapsed-time cap can extend ramp duration; no large catch-up step or timing-fault policy is introduced.
+
 ## 0.1.6
 
 ### Fixed
@@ -20,7 +36,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Mock regression coverage for left/right and zero-output failures, queued commands, shutdown/fault races, cleanup failure, adjustment-task panic, persistent faults and bounded diagnostics.
 - Hardware-check status output and a hardware-free `fault_check` example, including an optional cleanup failure.
 
-Existing public signatures, config literals and error variants remain compatible. Ramping, electrical behavior and left M4/right M1 example wiring are preserved. Hardware acceptance is pending operator testing.
+Existing public signatures, config literals and error variants remain compatible. Ramping, electrical behavior and left M4/right M1 example wiring are preserved.
 
 ## 0.1.5
 

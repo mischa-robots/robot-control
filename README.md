@@ -122,10 +122,28 @@ A background output failure now closes command admission, clears both pending ta
 | `fault` | First background output/task failure, retained after shutdown |
 | `cleanup_error` | Final stop failure, stored separately from the original fault |
 | `cleanup_complete` | Cleanup finished, even when its stop attempt failed |
+| `timing` | Bounded elapsed-time and skipped-tick diagnostics, added in 0.1.7 |
 
 The two optional diagnostics each retain at most 4096 UTF-8 bytes, including a truncation marker if needed. Rejected commands do not grow an error history. The new types are exported as `RobotStatus`, `RobotPhase` and `RobotOutputState`; existing error enums and config fields are unchanged.
 
 `Running` means commands are accepted, not that hardware passed a self-test. `drive().await` confirms target acceptance only. While running, output status remains conservatively `Unknown`, even at a zero target. `Stopped` means the final driver stop returned success; it is not sensor feedback or proof of mechanical standstill and cannot account for writes through external driver references. Successful fault cleanup therefore reports `Faulted` with `Stopped`; failed cleanup reports `Faulted` with `Unknown`. Use awaited shutdown to join cleanup, then inspect status.
+
+### Elapsed-time ramping (0.1.7)
+
+The nominal power slew rate is `adjustment_step / adjustment_interval` in seconds. Defaults remain 0.1 per 10 ms, or 10 power units/s. Each update moves toward its target by rate times monotonic elapsed time, bounded by the remaining distance. The first update still waits one interval. Actual elapsed time is sampled after waiting for the driver and control locks and includes the previous output batch's I/O time.
+
+Elapsed time is capped at one configured interval: no update changes power by more than `adjustment_step`, even after a long delay. A shorter gap produces a proportionally smaller change. Deadlines stay on the original schedule and missed ticks are skipped, including those passed during I/O; the controller does not replay overdue ticks or add I/O duration to a full sleep each iteration. Jitter and sustained overload can make ramps take longer than their nominal duration. Reversal still follows the existing ramp through zero without an added dwell policy.
+
+`robot.status().await.timing` returns `RobotTiming` with these diagnostics:
+
+| Field | Meaning |
+| --- | --- |
+| `overruns` | Updates with elapsed time greater than the configured interval, including ordinary timer jitter |
+| `skipped_ticks` | Missed scheduled ticks skipped after a delayed update or output batch |
+| `last_elapsed` | Actual spacing before the last update, before applying the elapsed-time cap |
+| `max_elapsed` | Largest observed update spacing, also uncapped |
+
+Counters saturate at `u64::MAX`; there is no growing history or per-overrun warning stream. Durations start at zero and diagnostics remain available after shutdown or a fault. Overruns alone do not latch a fault in this release. These are controller timing observations, not wheel-speed measurements or a real-time stopping guarantee.
 
 ## Examples
 
@@ -260,6 +278,22 @@ cargo run --example fault_check --no-default-features -- --cleanup-failure
 ```
 
 Both runs accept one target, inject a mock left M4 output failure, print stop attempts for M1–M4 and reject a later drive command. The first ends with `Faulted`/`Stopped`; the second retains both output and cleanup diagnostics and ends with `Faulted`/`Unknown`. Both report cleanup complete and keep the fault after repeated shutdown. The mock run normally finishes in under a second and has a two-second failure-notification guard. No bus disconnection or live wiring fault is needed.
+
+For v0.1.7 timing verification, first repeat the ordinary baseline with the accepted v0.1.6 configuration. Then use a slower nominal rate of 1 power unit/s, keeping tracks lifted and the power cutoff accessible:
+
+The example accepts `--adjustment-step` from 0.01 through 0.1 and `--interval-ms` from 10 through 20, inclusive. Values outside these ranges are rejected before opening the hardware. These simple example limits retain the defaults and the timing checks below; they are not motor stall or thermal protection. The library's configuration range is unchanged.
+
+```bash
+cargo run --example controller_check --features pca9685 -- --power 0.5 --adjustment-step 0.01 --interval-ms 10 --trace-output
+# Optional comparison: the same nominal rate with a 20 ms interval.
+cargo run --example controller_check --features pca9685 -- --power 0.5 --adjustment-step 0.02 --interval-ms 20 --trace-output
+# Restore the default 0.1 / 10 ms settings by omitting the timing options.
+cargo run --example controller_check --features pca9685 -- --power 0.5
+```
+
+Choose a modest power that moves your motors; 0.5 is an example. With +1 factors, the first `left only` request starts M4 from zero and should reach approximately PWM 2048 (0.5 power) in roughly 0.5 seconds under light load. Use the stage's `t=...s` request timestamp and the first corresponding `output ... motor=Motor4 pwm=2048 ... ok=true` line to estimate the time. At power 0.6 the nominal ramp is 0.6 seconds and the target PWM is 2457. Allow for tick phase, rounding, jitter and I/O time; compare requested-output timestamps, not wheel RPM.
+
+Output trace timestamps are taken after each driver call returns and share the stage clock; `ok=true` reports driver success, not sensed motion. Trace printing itself adds load, so also inspect the status timing counters and compare a run without tracing. Repeat under representative host/web activity without running a second controller against the same board. Record requested rate, observed ramp duration, timing diagnostics and differences from v0.1.6. Large delays must not create large power jumps. The example still uses the bounded baseline and explicit shutdown; the raw M1–M4 test's independent timing is unchanged.
 
 Record version, board/bus/address, wiring, factors, requested power, observed stopping times and pass/fail results. End the test with the power cutoff and investigate unexpected direction, loss of control, driver errors or motion after shutdown. Inject bus faults only in the automated mocks; do not unplug powered motor wiring. These observations supplement the mock race tests and do not establish mechanical standstill.
 

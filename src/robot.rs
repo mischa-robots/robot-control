@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -33,7 +34,8 @@ pub struct RobotConfig {
     pub left_motor: Motor,
     /// Which motor is the right motor (must differ from the left motor).
     pub right_motor: Motor,
-    /// Positive, finite speed adjustment step per tick (controls ramp smoothness).
+    /// Positive, finite nominal power change per interval. The slew rate is
+    /// step / interval in seconds; elapsed-time updates never exceed this step.
     pub adjustment_step: f32,
     /// Positive interval between motor adjustment ticks. Step divided by interval
     /// in seconds must also be positive and finite in `f32`.
@@ -109,6 +111,32 @@ pub enum RobotOutputState {
     Stopped,
 }
 
+/// Bounded timing diagnostics; counters saturate instead of keeping a history.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RobotTiming {
+    /// Updates whose actual elapsed time exceeded the configured interval,
+    /// including ordinary timer jitter. This does not latch a controller fault.
+    pub overruns: u64,
+    /// Scheduled ticks skipped rather than replayed after a delayed update/I/O.
+    pub skipped_ticks: u64,
+    /// Actual elapsed time before the last update, before the ramp cap.
+    /// Includes waiting for the driver lock; zero until the first update.
+    pub last_elapsed: Duration,
+    /// Largest observed update spacing, before the ramp cap.
+    pub max_elapsed: Duration,
+}
+
+impl RobotTiming {
+    fn record_elapsed(&mut self, elapsed: Duration, interval: Duration) {
+        self.last_elapsed = elapsed;
+        self.max_elapsed = self.max_elapsed.max(elapsed);
+        if elapsed > interval {
+            self.overruns = self.overruns.saturating_add(1);
+        }
+    }
+}
+
 /// A read-only snapshot obtained from [`Robot::status`].
 ///
 /// Keeps the first background failure and final cleanup failure separately.
@@ -127,6 +155,8 @@ pub struct RobotStatus {
     pub cleanup_error: Option<String>,
     /// Whether cleanup has finished, even if its stop attempt failed.
     pub cleanup_complete: bool,
+    /// Observed update spacing and skipped deadlines, retained after shutdown.
+    pub timing: RobotTiming,
 }
 
 struct ControlState {
@@ -212,6 +242,7 @@ impl Robot {
                     fault: None,
                     cleanup_error: None,
                     cleanup_complete: false,
+                    timing: RobotTiming::default(),
                 },
             }),
             config,
@@ -386,6 +417,10 @@ impl RobotState {
         let mut current_right_speed: f32 = 0.0;
         let step = self.config.adjustment_step;
         let interval = self.config.adjustment_interval;
+        let mut previous_update = Instant::now();
+        // Preserve the initial one-interval delay. A valid but unrepresentably
+        // distant deadline waits for cancellation instead of overflowing Instant.
+        let mut deadline = previous_update.checked_add(interval);
 
         loop {
             tokio::select! {
@@ -394,22 +429,33 @@ impl RobotState {
                     debug!("motor adjustment task cancelled");
                     break;
                 }
-                () = tokio::time::sleep(interval) => {}
+                () = wait_for_tick(deadline) => {}
             }
-
-            let (target_left, target_right) = self.control.lock().await.targets;
-
-            current_left_speed = ramp_toward(current_left_speed, target_left, step);
-            current_right_speed = ramp_toward(current_right_speed, target_right, step);
-
-            let left_pwm = speed_to_pwm(current_left_speed);
-            let right_pwm = speed_to_pwm(current_right_speed);
 
             let motor_board = tokio::select! {
                 biased;
                 () = self.cancel_token.cancelled() => break,
                 board = self.motor_board.lock() => board,
             };
+
+            // Sample elapsed time after lock waits, immediately before computing
+            // this output batch. Never hold the state lock during driver I/O.
+            let mut control = self.control.lock().await;
+            if self.cancel_token.is_cancelled() {
+                break;
+            }
+            let now = Instant::now();
+            let elapsed = now.duration_since(previous_update);
+            previous_update = now;
+            control.status.timing.record_elapsed(elapsed, interval);
+            let (target_left, target_right) = control.targets;
+            drop(control);
+
+            let change = elapsed_step(step, interval, elapsed);
+            current_left_speed = ramp_toward(current_left_speed, target_left, change);
+            current_right_speed = ramp_toward(current_right_speed, target_right, change);
+            let left_pwm = speed_to_pwm(current_left_speed);
+            let right_pwm = speed_to_pwm(current_right_speed);
 
             if let Err(e) = apply_motor_speed(
                 &*motor_board,
@@ -434,8 +480,57 @@ impl RobotState {
                     .await;
                 break;
             }
+            drop(motor_board);
+
+            let mut control = self.control.lock().await;
+            if let Some(previous_deadline) = deadline {
+                let (next, skipped) = next_tick(previous_deadline, interval, Instant::now());
+                deadline = next;
+                control.status.timing.skipped_ticks =
+                    control.status.timing.skipped_ticks.saturating_add(skipped);
+            }
         }
     }
+}
+
+async fn wait_for_tick(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Advance the original deadline grid strictly beyond now, including delays
+/// shorter than a timer's resolution. Never emit a burst of overdue ticks.
+fn next_tick(deadline: Instant, interval: Duration, now: Instant) -> (Option<Instant>, u64) {
+    let elapsed = now.saturating_duration_since(deadline);
+    let skipped = elapsed.as_nanos() / interval.as_nanos();
+    let remainder = elapsed.as_nanos() % interval.as_nanos();
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "remainder is below a Duration; fractional nanoseconds are below 1e9"
+    )]
+    let remainder = Duration::new(
+        (remainder / 1_000_000_000) as u64,
+        (remainder % 1_000_000_000) as u32,
+    );
+    (
+        now.max(deadline)
+            .checked_add(interval.saturating_sub(remainder)),
+        u64::try_from(skipped).unwrap_or(u64::MAX),
+    )
+}
+
+/// Rate times elapsed time, capped at one interval and at the configured step.
+fn elapsed_step(step: f32, interval: Duration, elapsed: Duration) -> f32 {
+    let rate = f64::from(step) / interval.as_secs_f64();
+    let change = (rate * elapsed.min(interval).as_secs_f64()).min(f64::from(step));
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "nonnegative change is bounded by the validated finite f32 step"
+    )]
+    let change = change as f32;
+    change
 }
 
 fn bounded_diagnostic(mut diagnostic: String) -> String {
@@ -506,6 +601,9 @@ fn apply_motor_speed(
 
 #[cfg(test)]
 mod lifecycle_tests;
+
+#[cfg(test)]
+mod timing_tests;
 
 #[cfg(test)]
 mod tests {

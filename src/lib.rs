@@ -40,7 +40,7 @@ pub use error::{MotorError, RobotError};
 pub use motor::{Motor, MotorDriver};
 #[cfg(feature = "pca9685")]
 pub use pca9685::Pca9685MotorBoard;
-pub use robot::{Robot, RobotConfig, RobotOutputState, RobotPhase, RobotStatus};
+pub use robot::{Robot, RobotConfig, RobotOutputState, RobotPhase, RobotStatus, RobotTiming};
 
 #[cfg(test)]
 pub mod mock;
