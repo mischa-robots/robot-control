@@ -172,8 +172,8 @@ Then open `http://<robot-ip>:8000` in a browser for the joystick control UI.
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/` | GET | Web UI with dual joystick control |
-| `/ws` | WebSocket | Real-time drive commands (`{"left": 0.5, "right": 0.5}`) |
-| `/drive?left=0.5&right=0.5` | GET | One-shot drive command |
+| `/ws` | WebSocket | Drive commands (`{"left": 0.5, "right": 0.5}`); one controlling session |
+| `/drive?left=0.5&right=0.5` | GET | Drive command when no WebSocket owner holds control |
 | `/health` | GET | JSON controller state; 200 running, 503 shutting down/shutdown/faulted |
 
 Since v0.1.8, `/health` replaces the unconditional `Healthy` text response with JSON. A normal running response is:
@@ -184,7 +184,27 @@ Since v0.1.8, `/health` replaces the unconditional `Healthy` text response with 
 
 This reports lifecycle and output certainty, not a hardware self-test or sensed motion. A fault remains unhealthy even if cleanup successfully stopped the outputs. During shutdown, the endpoint may briefly report 503 before the server closes its connections; it is unavailable once the server exits.
 
-The web example retains the robot until server completion and awaits cleanup on bind/serve failure, Ctrl-C and SIGTERM. On a shutdown signal it closes motion admission and finishes robot shutdown before stopping HTTP workers, so open WebSockets do not postpone motor cleanup. The default log filter includes the final `robot cleanup completed` status and fault/cleanup warnings. The original server error is preserved if cleanup also fails; a cleanup/controller failure otherwise produces an error exit. SIGKILL, power loss and indefinitely blocked I/O cannot be handled by this shutdown path. Web command ownership and expiry are separate later checkpoints.
+The web example retains the robot until server completion and awaits cleanup on bind/serve failure, Ctrl-C and SIGTERM. On a shutdown signal it closes motion admission and finishes robot shutdown before stopping HTTP workers, so open WebSockets do not postpone motor cleanup. The default log filter includes the final `robot cleanup completed` status and fault/cleanup warnings. The original server error is preserved if cleanup also fails; a cleanup/controller failure otherwise produces an error exit. SIGKILL, power loss and indefinitely blocked I/O cannot be handled by this shutdown path. Finite command expiry remains a later checkpoint.
+
+#### Ordered web control and ownership (v0.1.9)
+
+Opening a WebSocket does not claim control. Its first valid, admitted left/right command claims ownership until disconnect, including when the owner commands zero. Additional sessions can connect, but their drive/stop requests receive `busy`; closing a non-owner session does not stop the robot. HTTP commands, including zero demand, are also rejected while a WebSocket owns control. This coordinates clients of one server, not separate processes opening the board.
+
+One worker applies admitted commands in order through `Robot`. At most 32 ordinary commands wait, plus one in-flight command and one reserved pending stop. Queue overflow rejects the new command without claiming ownership. A zero/zero command uses the reserved stop slot and cancels older queued commands with `superseded`; repeated pending stops coalesce. Later admitted commands run after the stop. These stops use ordinary ramp-to-zero behavior.
+
+Owner disconnect cancels all pending commands with `disconnected` and requests a priority smooth stop after any in-flight command. New ownership and HTTP commands are blocked until that stop target is accepted by `Robot`, which does not mean the ramp or mechanical stopping has finished. A new session must submit a fresh command; queued commands from the old session cannot restart motion. Malformed, non-finite or unsupported WebSocket messages close the offending session and release any ownership. Invalid HTTP requests do not acquire ownership or affect an existing owner.
+
+WebSocket connections initially receive `{"status":"ready"}`. Successful command acknowledgements and HTTP responses use `{"status":"accepted"}`; this confirms target acceptance, not hardware application. Errors use JSON such as `{"code":"busy","error":"..."}`. The example's HTTP success body therefore changes from `Driving` to JSON in this release:
+
+| HTTP status | Error code | Meaning |
+| --- | --- | --- |
+| 400 | `invalid` | Missing, malformed or non-finite input |
+| 409 | `busy` | Another session owns control, or owner release is pending |
+| 409 | `superseded`, `disconnected` | A previously queued command was cancelled |
+| 429 | `queue_full` | Waiting command capacity exhausted |
+| 503 | `fault`, `shutdown` | Controller failure or closed command admission |
+
+The browser displays ownership/errors and clears local demands on rejection or connection loss. A busy response does not retry the rejected command; another deliberate joystick action can try again after the owner releases control. On overload or controller errors, the browser closes its stream to release ownership; reload and give fresh input to reconnect. No automatic command replay or heartbeat is added. Commands, including HTTP commands, remain persistent, and a silently broken connection may retain ownership and motion until the server detects its closure. Finite expiry belongs to v0.1.10.
 
 #### Architecture (web server example)
 
@@ -197,6 +217,7 @@ The web example retains the robot until server completion and awaits cleanup on 
 │  │  Web Server (examples/web_server.rs)       │ │
 │  │  ├─ /ws → WebSocket actor                  │ │
 │  │  ├─ /drive → HTTP handler                  │ │
+│  │  ├─ Shared command queue + single owner    │ │
 │  │  └─ / → static files                       │ │
 │  └──────────────────────────────┬─────────────┘ │
 │                                 │               │
@@ -351,6 +372,25 @@ python3 -m http.server 8000 --bind 127.0.0.1
 
 Leave that process running and, in a second terminal, start the web example on the same address/port using the foreground command above. Expect a nonzero exit with the original address-in-use error, preceded by completed robot cleanup with `Shutdown`/`Stopped` and no cleanup errors. No drive command is needed; verify the motors stay off. Stop the Python server with Ctrl-C afterward. Do not use a second robot web server to occupy the port. Serve failures and background driver faults are covered by mocks; do not induce live wiring faults.
 
+#### Web ownership verification (v0.1.9)
+
+Repeat the controller baseline and v0.1.8 lifecycle checks first. Keep tracks lifted, use your previously accepted modest power and factors, and keep the power cutoff accessible. Start one web server, then open two tabs (A and B) at its UI. Reload both tabs to load the matching v0.1.9 browser files.
+
+1. Move a joystick in A. It should report that you control the robot. Releasing the joystick commands smooth zero but retains ownership.
+2. Try the joysticks in B: it should report that another client controls the robot, and must not change the outputs. Closing B must not stop A's motion. To hold a modest demand while switching tabs, you can use A's browser console: `sendDriveCommand(0.25, 0.25)`, followed promptly by `sendDriveCommand(0, 0)` to stop. Use your accepted power; commands do not expire yet.
+3. While A owns control, run the HTTP requests below on the robot host. Both must return HTTP 409 with `code: busy` and leave A's target unchanged, including the zero request.
+
+```bash
+curl -i 'http://127.0.0.1:8000/drive?left=0.25&right=0.25'
+curl -i 'http://127.0.0.1:8000/drive?left=0&right=0'
+```
+
+4. With a modest command active in A, close A. Expect the ordinary smooth stop. Reopen a tab: connection alone must not start motion. Deliberate new input can claim control after the previous stop request is accepted.
+5. Close all controlling tabs. Repeat the two HTTP requests in order, promptly issuing zero after the motion check. Expect HTTP 200 and `status: accepted` for both. Also try a missing or invalid parameter: expect HTTP 400 JSON without changing demand.
+6. Finish with Ctrl-C or SIGTERM and confirm the v0.1.8 completed-cleanup status and outputs remaining off.
+
+Do not use network disconnection to test expiry in this version, and do not flood the real robot to test overflow. Queue saturation, stale-command rejection and artificial delays are covered by mocks. Record which tab owned control, observed busy responses and stop behavior.
+
 Record version, board/bus/address, wiring, factors, requested power, observed stopping times and pass/fail results. End the test with the power cutoff and investigate unexpected direction, loss of control, driver errors or motion after shutdown. Inject bus faults only in the automated mocks; do not unplug powered motor wiring. These observations supplement the mock race tests and do not establish mechanical standstill.
 
 
@@ -365,6 +405,10 @@ Record version, board/bus/address, wiring, factors, requested power, observed st
 ```bash
 # Run tests (no hardware needed)
 cargo test
+cargo test --example web_server --all-features
+
+# Browser connection tests (Node.js with the built-in test runner)
+node --test tests/web_control.test.cjs
 
 # Check formatting + lints
 cargo fmt --all --check

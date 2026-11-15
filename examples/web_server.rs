@@ -13,7 +13,7 @@
 
 use actix::prelude::*;
 use actix_files::{Files, NamedFile};
-use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, web};
+use actix_web::{App, HttpRequest, HttpResponse, HttpServer, web};
 use actix_web_actors::ws;
 use clap::Parser;
 use serde::Deserialize;
@@ -21,11 +21,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::{future::Future, io};
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use robot_control::motor::{Motor, MotorDriver};
 use robot_control::robot::{Robot, RobotConfig, RobotPhase};
+
+#[path = "web_server/control.rs"]
+mod control;
+use control::{Control, ControlError, Session, receipt_result};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -65,6 +69,9 @@ struct Cli {
 }
 
 #[cfg(test)]
+#[path = "web_server/control_tests.rs"]
+mod control_tests;
+#[cfg(test)]
 #[path = "web_server/tests.rs"]
 mod tests;
 
@@ -73,71 +80,110 @@ mod tests;
 // ---------------------------------------------------------------------------
 
 struct RobotWsActor {
-    robot: Arc<Robot>,
+    control: Control,
+    session: Session,
 }
 
 impl RobotWsActor {
-    fn new(robot: Arc<Robot>) -> Self {
-        Self { robot }
+    fn new(control: Control) -> Self {
+        Self {
+            control,
+            session: Session::new(),
+        }
+    }
+
+    fn submit_text(&self, text: &str) -> Result<control::Receipt, ControlError> {
+        match parse_drive(text) {
+            Ok(params) => self.control.submit(Some(&self.session), params),
+            Err(error) => {
+                self.control.disconnect(&self.session);
+                Err(error)
+            }
+        }
+    }
+
+    fn reject_invalid(&self, error: &ControlError, ctx: &mut ws::WebsocketContext<Self>) {
+        ctx.text(error.json());
+        // Invalid traffic cannot hold ownership indefinitely. Release any
+        // owned stream before closing, invalidating its pending commands.
+        self.control.disconnect(&self.session);
+        ctx.close(Some(ws::CloseReason {
+            code: ws::CloseCode::Policy,
+            description: Some("invalid drive message".into()),
+        }));
+        ctx.stop();
     }
 }
 
 impl Actor for RobotWsActor {
     type Context = ws::WebsocketContext<Self>;
 
-    fn started(&mut self, _ctx: &mut Self::Context) {
+    fn started(&mut self, ctx: &mut Self::Context) {
         info!("WebSocket client connected");
+        ctx.text(serde_json::json!({"status": "ready"}).to_string());
     }
 
     fn stopped(&mut self, _ctx: &mut Self::Context) {
         info!("WebSocket client disconnected");
-        let robot = self.robot.clone();
-        actix_rt::spawn(async move {
-            if let Err(e) = robot.stop().await {
-                warn!("failed to stop robot on disconnect: {e}");
-            }
-        });
+        self.control.disconnect(&self.session);
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 struct DriveParams {
     left: f32,
     right: f32,
 }
 
+fn parse_drive(text: &str) -> Result<DriveParams, ControlError> {
+    let params: DriveParams = serde_json::from_str(text)
+        .map_err(|error| ControlError::new("invalid", format!("invalid drive message: {error}")))?;
+    if !params.left.is_finite() || !params.right.is_finite() {
+        return Err(ControlError::new(
+            "invalid",
+            "left and right must be finite numbers",
+        ));
+    }
+    Ok(params)
+}
+
 impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for RobotWsActor {
     fn handle(&mut self, msg: Result<ws::Message, ws::ProtocolError>, ctx: &mut Self::Context) {
         match msg {
-            Ok(ws::Message::Text(text)) => match serde_json::from_str::<DriveParams>(&text) {
-                Ok(params) => {
-                    let robot = self.robot.clone();
-                    actix_rt::spawn(async move {
-                        if let Err(e) = robot.drive(params.left, params.right).await {
-                            warn!("drive command failed: {e}");
-                        }
-                    });
+            Ok(ws::Message::Text(text)) => {
+                match self.submit_text(&text) {
+                    Ok(receipt) => {
+                        // Only await an acknowledgement here. Admission happens
+                        // synchronously in receive order; one worker applies it.
+                        ctx.spawn(receipt_result(receipt).into_actor(self).map(
+                            |result, _, ctx| match result {
+                                Ok(()) => {
+                                    ctx.text(serde_json::json!({"status": "accepted"}).to_string());
+                                }
+                                Err(error) => ctx.text(error.json()),
+                            },
+                        ));
+                    }
+                    Err(error) if error.code == "invalid" => self.reject_invalid(&error, ctx),
+                    Err(error) => ctx.text(error.json()),
                 }
-                Err(e) => {
-                    debug!("invalid WebSocket message: {e}");
-                    ctx.text(format!(r#"{{"error":"invalid message: {e}"}}"#));
-                }
-            },
+            }
             Ok(ws::Message::Ping(data)) => ctx.pong(&data),
             Ok(ws::Message::Close(reason)) => {
-                info!("WebSocket close received");
-                let robot = self.robot.clone();
-                actix_rt::spawn(async move {
-                    if let Err(e) = robot.stop().await {
-                        warn!("failed to stop robot on close: {e}");
-                    }
-                });
+                self.control.disconnect(&self.session);
                 ctx.close(reason);
                 ctx.stop();
             }
+            Ok(ws::Message::Binary(_) | ws::Message::Continuation(_)) => {
+                self.reject_invalid(
+                    &ControlError::new("invalid", "expected a complete JSON text message"),
+                    ctx,
+                );
+            }
             Ok(_) => {}
-            Err(e) => {
-                warn!("WebSocket protocol error: {e}");
+            Err(error) => {
+                warn!("WebSocket protocol error: {error}");
+                self.control.disconnect(&self.session);
                 ctx.stop();
             }
         }
@@ -173,22 +219,37 @@ async fn index() -> actix_web::Result<NamedFile> {
 async fn robot_ws(
     req: HttpRequest,
     stream: web::Payload,
-    robot: web::Data<Arc<Robot>>,
+    control: web::Data<Control>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let actor = RobotWsActor::new(robot.get_ref().clone());
+    let actor = RobotWsActor::new(control.get_ref().clone());
     ws::start(actor, &req, stream)
 }
 
-async fn drive_robot(
-    robot: web::Data<Arc<Robot>>,
-    params: web::Query<DriveParams>,
-) -> impl Responder {
-    match robot.drive(params.left, params.right).await {
-        Ok(()) => HttpResponse::Ok().body("Driving"),
-        Err(e) => {
-            warn!("drive request failed: {e}");
-            HttpResponse::InternalServerError().body(format!("Error: {e}"))
-        }
+fn control_error_response(error: &ControlError) -> HttpResponse {
+    let mut response = match error.code {
+        "invalid" => HttpResponse::BadRequest(),
+        "busy" | "superseded" | "disconnected" => HttpResponse::Conflict(),
+        "queue_full" => HttpResponse::TooManyRequests(),
+        _ => HttpResponse::ServiceUnavailable(),
+    };
+    response.json(error)
+}
+
+fn query_config() -> web::QueryConfig {
+    web::QueryConfig::default().error_handler(|error, _| {
+        let response = control_error_response(&ControlError::new("invalid", error.to_string()));
+        actix_web::error::InternalError::from_response(error, response).into()
+    })
+}
+
+async fn drive_robot(control: web::Data<Control>, params: web::Query<DriveParams>) -> HttpResponse {
+    let result = match control.submit(None, params.into_inner()) {
+        Ok(receipt) => receipt_result(receipt).await,
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({"status": "accepted"})),
+        Err(error) => control_error_response(&error),
     }
 }
 
@@ -325,10 +386,14 @@ async fn main() -> std::io::Result<()> {
     let bind_addr = format!("{}:{}", cli.host, cli.port);
 
     let app_robot = robot.clone();
-    with_robot_cleanup(&robot, async {
+    let (control, worker) = Control::start(robot.clone());
+    let app_control = control.clone();
+    let result = with_robot_cleanup(&robot, async {
         let server = HttpServer::new(move || {
             App::new()
                 .app_data(web::Data::new(app_robot.clone()))
+                .app_data(web::Data::new(app_control.clone()))
+                .app_data(query_config())
                 .route("/health", web::get().to(health_check))
                 .route("/drive", web::get().to(drive_robot))
                 .route("/", web::get().to(index))
@@ -341,5 +406,11 @@ async fn main() -> std::io::Result<()> {
         let handle = server.handle();
         serve_until_exit(&robot, server, signal, || handle.stop(false)).await
     })
-    .await
+    .await;
+    control.close();
+    let joined = worker.await.map_err(io::Error::other);
+    if let Err(error) = &joined {
+        warn!(%error, "web command worker failed");
+    }
+    result.and(joined)
 }

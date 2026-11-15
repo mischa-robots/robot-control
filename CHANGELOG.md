@@ -7,6 +7,30 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## Unreleased
 
+## 0.1.9
+
+### Fixed
+
+Web server example:
+
+- Serialize WebSocket and HTTP motion through one worker with a 32-command waiting queue. Admit WebSocket commands in receive order instead of spawning independent motion tasks.
+- Claim control on the first valid, admitted WebSocket command. Other sessions and HTTP cannot drive or stop while that owner holds control; a non-owner disconnect has no motor effect.
+- On owner disconnect, discard pending commands and request the existing smooth stop before admitting another owner. A command already in flight completes before that stop; old queued demands cannot restart motion afterward.
+- Give zero-demand stops a reserved slot even when the ordinary queue is full. Stops supersede older queued commands; subsequent accepted commands run after the stop. Invalid WebSocket messages close the session and release any ownership.
+
+### Changed
+
+- Web command responses are JSON: `accepted` confirms Robot target acceptance, and errors include `code` and `error`. HTTP reports invalid input as 400, ownership/cancelled commands as 409, queue overflow as 429 and controller fault/shutdown as 503. The left/right request shape and finite clamping remain unchanged.
+- Browser status shows acceptance, contention and errors, clears local demand on rejection/disconnection, and never retries stored commands. Queue overload or controller errors close the browser's stream to release control.
+- Log server rejections, malformed responses and WebSocket connection errors to the browser console for debugging; normal status/acceptance and routine stop supersessions remain quiet.
+
+### Added
+
+- Mock tests for ordered commands under delay, bounded overflow, priority stops, ownership, disconnect/reconnect, invalid requests, HTTP conflicts and fault diagnostics; a Robot integration check retains smooth-stop behavior.
+- Browser connection tests and an operator procedure for two-tab ownership and HTTP conflicts.
+
+Library API, electrical behavior, defaults and left M4/right M1 wiring are unchanged. Ownership applies within one web server process. Silent connection loss and finite command expiry remain v0.1.10 work; commands still persist until replaced/stopped. Hardware acceptance is pending operator testing.
+
 ## 0.1.8
 
 ### Fixed

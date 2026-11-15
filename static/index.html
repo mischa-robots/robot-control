@@ -28,9 +28,11 @@
         }
     </style>
     <script src="static/nipplejs.min.js"></script>
+    <script src="static/control.js"></script>
 </head>
 <body>
     <h1>Robot Control</h1>
+    <p id="controlStatus" role="status" aria-live="polite">Connecting…</p>
     <div id="joysticks">
         <div id="leftJoystick" class="joystick"></div>
         <div id="rightJoystick" class="joystick"></div>
@@ -40,24 +42,11 @@
         const leftJoystick = document.getElementById('leftJoystick');
         const rightJoystick = document.getElementById('rightJoystick');
 
-        const socketProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const socket = new WebSocket(`${socketProtocol}//${location.host}/ws`);
-
-        socket.onopen = () => {
-            console.log('WebSocket connection established');
-        };
-
-        socket.onerror = (error) => {
-            console.error('WebSocket error:', error);
-        };
-
-        function sendDriveCommand(left, right) {
-            if (socket.readyState !== WebSocket.OPEN) {
-                return;
-            }
-            const message = JSON.stringify({ left, right });
-            socket.send(message);
-        }
+        const { sendDriveCommand } = connectRobot(
+            WebSocket, location,
+            (message) => { document.getElementById('controlStatus').textContent = message; },
+            () => { leftJoystick.value = 0; rightJoystick.value = 0; }
+        );
 
         const leftNipple = nipplejs.create({
             zone: leftJoystick,
