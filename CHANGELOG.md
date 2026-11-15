@@ -7,6 +7,28 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## Unreleased
 
+## 0.1.8
+
+### Fixed
+
+Webserver example:
+- Retain the robot at the web server's top level and await cleanup on normal completion, bind/startup errors and serve errors. Preserve the original server error while reporting controller/cleanup failures.
+- Handle Ctrl-C and SIGTERM explicitly: close motor command admission and await robot shutdown before stopping HTTP workers and joining the server. Long-lived WebSockets do not delay the initial robot shutdown.
+- Report board/configuration startup errors instead of panicking; attempt an exhaustive board stop if robot configuration is rejected after the board opens.
+
+### Changed
+
+Webserver example:
+- `/health` now returns JSON controller state: HTTP 200 for `Running`, HTTP 503 for `ShuttingDown`, `Shutdown` or `Faulted`, with output certainty and fault/cleanup diagnostics. This replaces the unconditional `Healthy` text response; it is not a hardware self-test.
+- Enable web example lifecycle/cleanup logs in the default logging filter.
+
+### Added
+
+- Mock web lifecycle and HTTP health tests for startup/serve errors, awaited cleanup, injected shutdown signals, error precedence and background driver faults.
+- Operator verification for Ctrl-C, SIGTERM and an occupied HTTP port without a competing motor controller.
+
+Library API, motor behavior and web command lifetime/ownership are unchanged. SIGKILL, power loss and indefinitely blocked hardware I/O remain outside the cleanup guarantee.
+
 ## 0.1.7
 
 ### Fixed

@@ -19,12 +19,13 @@ use clap::Parser;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::{future::Future, io};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use robot_control::motor::{Motor, MotorDriver};
-use robot_control::robot::{Robot, RobotConfig};
+use robot_control::robot::{Robot, RobotConfig, RobotPhase};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -64,30 +65,8 @@ struct Cli {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::Cli;
-    use clap::Parser;
-
-    #[test]
-    fn accepts_negative_motor_factors() {
-        let cli = Cli::try_parse_from([
-            "web_server",
-            "--host",
-            "0.0.0.0",
-            "--port",
-            "8080",
-            "--left-factor",
-            "-1.0",
-            "--right-factor",
-            "-0.5",
-        ])
-        .expect("negative motor factors should be accepted");
-
-        assert_eq!(cli.left_factor, -1.0);
-        assert_eq!(cli.right_factor, -0.5);
-        assert_eq!(cli.port, 8080);
-    }
-}
+#[path = "web_server/tests.rs"]
+mod tests;
 
 // ---------------------------------------------------------------------------
 // WebSocket actor
@@ -169,8 +148,21 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for RobotWsActor {
 // HTTP handlers
 // ---------------------------------------------------------------------------
 
-async fn health_check() -> impl Responder {
-    HttpResponse::Ok().body("Healthy")
+async fn health_check(robot: web::Data<Arc<Robot>>) -> HttpResponse {
+    let status = robot.status().await;
+    let mut response = if status.phase == RobotPhase::Running {
+        HttpResponse::Ok()
+    } else {
+        HttpResponse::ServiceUnavailable()
+    };
+    // Reports controller state, not a hardware self-test or measured motion.
+    response.json(serde_json::json!({
+        "phase": format!("{:?}", status.phase),
+        "output": format!("{:?}", status.output),
+        "fault": status.fault,
+        "cleanup_error": status.cleanup_error,
+        "cleanup_complete": status.cleanup_complete,
+    }))
 }
 
 async fn index() -> actix_web::Result<NamedFile> {
@@ -204,21 +196,94 @@ async fn drive_robot(
 // Motor driver factory
 // ---------------------------------------------------------------------------
 
-fn create_motor_driver(cli: &Cli) -> Arc<Mutex<dyn MotorDriver>> {
+fn create_motor_driver(cli: &Cli) -> io::Result<Arc<Mutex<dyn MotorDriver>>> {
     #[cfg(feature = "pca9685")]
     {
         let board = robot_control::Pca9685MotorBoard::new(&cli.i2c_bus, cli.i2c_addr)
-            .expect("failed to initialize PCA9685 motor board");
-        Arc::new(Mutex::new(board))
+            .map_err(io::Error::other)?;
+        Ok(Arc::new(Mutex::new(board)))
     }
 
     #[cfg(not(feature = "pca9685"))]
     {
         let _ = cli;
-        panic!(
+        Err(io::Error::other(
             "No motor driver available. Build with `--features pca9685` for real hardware, \
-             or implement `MotorDriver` for your board."
-        );
+             or implement `MotorDriver` for your board.",
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Server lifecycle (injected futures keep tests independent of sockets/signals)
+// ---------------------------------------------------------------------------
+
+async fn with_robot_cleanup(
+    robot: &Robot,
+    operation: impl Future<Output = io::Result<()>>,
+) -> io::Result<()> {
+    let result = operation.await;
+    robot.shutdown().await;
+    let status = robot.status().await;
+    info!(?status, "robot cleanup completed");
+    if let Some(error) = &status.fault {
+        warn!(%error, "robot controller fault");
+    }
+    if let Some(error) = &status.cleanup_error {
+        warn!(%error, "robot cleanup failed; outputs are uncertain");
+    }
+    // Never replace the original bind/serve/signal error with a cleanup error.
+    result?;
+    if let Some(error) = status.cleanup_error.or(status.fault) {
+        return Err(io::Error::other(error));
+    }
+    Ok(())
+}
+
+async fn serve_until_exit<Stop, Stopped>(
+    robot: &Robot,
+    server: impl Future<Output = io::Result<()>>,
+    signal: impl Future<Output = io::Result<()>>,
+    stop_server: Stop,
+) -> io::Result<()>
+where
+    Stop: FnOnce() -> Stopped,
+    Stopped: Future<Output = ()>,
+{
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result,
+        result = signal => {
+            info!("server shutdown requested; stopping robot");
+            // Close motion admission and finish motor cleanup before waiting on
+            // HTTP workers or long-lived WebSocket connections.
+            robot.shutdown().await;
+            // Actix's server future must keep being polled while its handle's
+            // stop acknowledgement is awaited. Do not just drop the server.
+            let (server_result, ()) = tokio::join!(server, stop_server());
+            result.and(server_result)
+        }
+    }
+}
+
+fn shutdown_signal() -> io::Result<impl Future<Output = io::Result<()>>> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        // Install both handlers before hardware initialization.
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let mut terminate = signal(SignalKind::terminate())?;
+        Ok(async move {
+            let received = tokio::select! {
+                received = interrupt.recv() => received,
+                received = terminate.recv() => received,
+            };
+            received.ok_or_else(|| io::Error::other("shutdown signal stream closed"))
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(tokio::signal::ctrl_c())
     }
 }
 
@@ -229,16 +294,16 @@ fn create_motor_driver(cli: &Cli) -> Arc<Mutex<dyn MotorDriver>> {
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("robot_control=info,actix_web=info")),
-        )
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new("robot_control=info,web_server=info,actix_web=info")
+        }))
         .init();
 
     let cli = Cli::parse();
+    let signal = shutdown_signal()?;
     info!(host = %cli.host, port = cli.port, "starting robot control server");
 
-    let motor_board = create_motor_driver(&cli);
+    let motor_board = create_motor_driver(&cli)?;
     let config = RobotConfig {
         left_motor: Motor::Motor4,
         right_motor: Motor::Motor1,
@@ -246,21 +311,35 @@ async fn main() -> std::io::Result<()> {
         right_motor_factor: cli.right_factor,
         ..RobotConfig::default()
     };
-    let robot = Robot::new(motor_board, config).expect("failed to create robot");
+    let robot = match Robot::new(motor_board.clone(), config) {
+        Ok(robot) => robot,
+        Err(error) => {
+            if let Err(cleanup_error) = motor_board.lock().await.stop_all() {
+                warn!(%cleanup_error, "failed to stop board after robot startup failure");
+            }
+            return Err(io::Error::other(error));
+        }
+    };
 
     let static_dir = cli.static_dir.clone();
     let bind_addr = format!("{}:{}", cli.host, cli.port);
 
-    HttpServer::new(move || {
-        App::new()
-            .app_data(web::Data::new(robot.clone()))
-            .route("/health", web::get().to(health_check))
-            .route("/drive", web::get().to(drive_robot))
-            .route("/", web::get().to(index))
-            .route("/ws", web::get().to(robot_ws))
-            .service(Files::new("/static", static_dir.clone()).show_files_listing())
+    let app_robot = robot.clone();
+    with_robot_cleanup(&robot, async {
+        let server = HttpServer::new(move || {
+            App::new()
+                .app_data(web::Data::new(app_robot.clone()))
+                .route("/health", web::get().to(health_check))
+                .route("/drive", web::get().to(drive_robot))
+                .route("/", web::get().to(index))
+                .route("/ws", web::get().to(robot_ws))
+                .service(Files::new("/static", static_dir.clone()).show_files_listing())
+        })
+        .disable_signals()
+        .bind(&bind_addr)?
+        .run();
+        let handle = server.handle();
+        serve_until_exit(&robot, server, signal, || handle.stop(false)).await
     })
-    .bind(&bind_addr)?
-    .run()
     .await
 }

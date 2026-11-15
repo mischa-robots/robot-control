@@ -174,7 +174,17 @@ Then open `http://<robot-ip>:8000` in a browser for the joystick control UI.
 | `/` | GET | Web UI with dual joystick control |
 | `/ws` | WebSocket | Real-time drive commands (`{"left": 0.5, "right": 0.5}`) |
 | `/drive?left=0.5&right=0.5` | GET | One-shot drive command |
-| `/health` | GET | Health check |
+| `/health` | GET | JSON controller state; 200 running, 503 shutting down/shutdown/faulted |
+
+Since v0.1.8, `/health` replaces the unconditional `Healthy` text response with JSON. A normal running response is:
+
+```json
+{"phase":"Running","output":"Unknown","fault":null,"cleanup_error":null,"cleanup_complete":false}
+```
+
+This reports lifecycle and output certainty, not a hardware self-test or sensed motion. A fault remains unhealthy even if cleanup successfully stopped the outputs. During shutdown, the endpoint may briefly report 503 before the server closes its connections; it is unavailable once the server exits.
+
+The web example retains the robot until server completion and awaits cleanup on bind/serve failure, Ctrl-C and SIGTERM. On a shutdown signal it closes motion admission and finishes robot shutdown before stopping HTTP workers, so open WebSockets do not postpone motor cleanup. The default log filter includes the final `robot cleanup completed` status and fault/cleanup warnings. The original server error is preserved if cleanup also fails; a cleanup/controller failure otherwise produces an error exit. SIGKILL, power loss and indefinitely blocked I/O cannot be handled by this shutdown path. Web command ownership and expiry are separate later checkpoints.
 
 #### Architecture (web server example)
 
@@ -294,6 +304,52 @@ cargo run --example controller_check --features pca9685 -- --power 0.5
 Choose a modest power that moves your motors; 0.5 is an example. With +1 factors, the first `left only` request starts M4 from zero and should reach approximately PWM 2048 (0.5 power) in roughly 0.5 seconds under light load. Use the stage's `t=...s` request timestamp and the first corresponding `output ... motor=Motor4 pwm=2048 ... ok=true` line to estimate the time. At power 0.6 the nominal ramp is 0.6 seconds and the target PWM is 2457. Allow for tick phase, rounding, jitter and I/O time; compare requested-output timestamps, not wheel RPM.
 
 Output trace timestamps are taken after each driver call returns and share the stage clock; `ok=true` reports driver success, not sensed motion. Trace printing itself adds load, so also inspect the status timing counters and compare a run without tracing. Repeat under representative host/web activity without running a second controller against the same board. Record requested rate, observed ramp duration, timing diagnostics and differences from v0.1.6. Large delays must not create large power jumps. The example still uses the bounded baseline and explicit shutdown; the raw M1–M4 test's independent timing is unchanged.
+
+#### Web lifecycle verification (v0.1.8)
+
+Repeat the controller baseline first, with the same wiring/factors as the accepted v0.1.7 configuration. For these web checks, keep tracks lifted and use a modest power already shown to move your motors. Run only one motor controller at a time. The commands below use default factors and localhost; apply your tested factors/bus/address when starting the server.
+
+Build once and run the binary directly so signals target the server rather than a Cargo wrapper:
+
+```bash
+cargo build --example web_server --features pca9685
+RUST_LOG=robot_control=info,web_server=info,actix_web=info \
+  target/debug/examples/web_server --host 127.0.0.1 --port 8000
+```
+
+In a second terminal, check health and request modest motion (0.25 is only an example):
+
+```bash
+curl -i http://127.0.0.1:8000/health
+curl --fail 'http://127.0.0.1:8000/drive?left=0.25&right=0.25'
+```
+
+Expect HTTP 200 with `phase: Running`, `output: Unknown`, and null fault/cleanup diagnostics. Press Ctrl-C in the server terminal while motion is commanded. Expect `robot cleanup completed` with `Shutdown`, `Stopped`, `cleanup_complete: true`, and no fault/cleanup error, before the process exits. Confirm outputs remain off after exit. Repeat with a browser WebSocket open if desired; the server should not wait for the browser to disconnect before stopping the robot. These web commands remain persistent in v0.1.8, so terminate the server promptly after checking motion.
+
+After the first server has exited, repeat using SIGTERM. In one terminal:
+
+```bash
+RUST_LOG=robot_control=info,web_server=info,actix_web=info \
+  target/debug/examples/web_server --host 127.0.0.1 --port 8000 &
+web_pid=$!
+```
+
+Once startup completes, run the health/drive requests from the other terminal. Then return to the launch terminal to signal the server directly and wait for cleanup and exit:
+
+```bash
+kill -TERM "$web_pid"
+wait "$web_pid"
+```
+
+Execute the signal commands only after requesting motion. Expect the same final cleanup status and a successful exit on healthy hardware. Do not use SIGKILL for this check.
+
+For bind failure, start with the robot stopped and all motor-controller processes exited. Occupy port 8000 using a server that never accesses the motor board:
+
+```bash
+python3 -m http.server 8000 --bind 127.0.0.1
+```
+
+Leave that process running and, in a second terminal, start the web example on the same address/port using the foreground command above. Expect a nonzero exit with the original address-in-use error, preceded by completed robot cleanup with `Shutdown`/`Stopped` and no cleanup errors. No drive command is needed; verify the motors stay off. Stop the Python server with Ctrl-C afterward. Do not use a second robot web server to occupy the port. Serve failures and background driver faults are covered by mocks; do not induce live wiring faults.
 
 Record version, board/bus/address, wiring, factors, requested power, observed stopping times and pass/fail results. End the test with the power cutoff and investigate unexpected direction, loss of control, driver errors or motion after shutdown. Inject bus faults only in the automated mocks; do not unplug powered motor wiring. These observations supplement the mock race tests and do not establish mechanical standstill.
 
