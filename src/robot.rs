@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -157,14 +157,26 @@ pub struct RobotStatus {
     pub cleanup_complete: bool,
     /// Observed update spacing and skipped deadlines, retained after shutdown.
     pub timing: RobotTiming,
+    /// Finite commands whose deadlines elapsed; saturates instead of growing a history.
+    pub expired_commands: u64,
 }
 
 struct ControlState {
     targets: (f32, f32),
+    expires: Option<Instant>,
     status: RobotStatus,
 }
 
 impl ControlState {
+    fn expire_if_due(&mut self, now: Instant) {
+        if self.expires.is_some_and(|deadline| deadline <= now) {
+            self.status.expired_commands = self.status.expired_commands.saturating_add(1);
+            debug!("finite drive expired; smooth stop requested");
+            self.targets = (0.0, 0.0);
+            self.expires = None;
+        }
+    }
+
     fn check_admission(&self, cancelled: bool) -> Result<(), RobotError> {
         if let Some(diagnostic) = &self.status.fault {
             let cleanup = self
@@ -212,6 +224,7 @@ struct RobotState {
     control: Mutex<ControlState>,
     config: RobotConfig,
     cancel_token: CancellationToken,
+    wake: Notify,
 }
 
 impl Robot {
@@ -236,6 +249,7 @@ impl Robot {
             motor_board,
             control: Mutex::new(ControlState {
                 targets: (0.0, 0.0),
+                expires: None,
                 status: RobotStatus {
                     phase: RobotPhase::Running,
                     output: RobotOutputState::Unknown,
@@ -243,10 +257,12 @@ impl Robot {
                     cleanup_error: None,
                     cleanup_complete: false,
                     timing: RobotTiming::default(),
+                    expired_commands: 0,
                 },
             }),
             config,
             cancel_token,
+            wake: Notify::new(),
         });
 
         let adjustment = tokio::spawn(state.clone().smooth_motor_adjustment());
@@ -301,11 +317,107 @@ impl Robot {
         let left = scaled_demand(left, self.state.config.left_motor_factor);
         let right = scaled_demand(right, self.state.config.right_motor_factor);
 
+        control.expire_if_due(Instant::now());
+        control.expires = None;
         control.targets = (left, right);
         drop(control);
 
+        self.state.wake.notify_one();
         debug!(left, right, "drive target set");
         Ok(())
+    }
+
+    /// Accept a finite drive command. Its deadline starts at submission, before
+    /// waiting for the control lock. Expiry sets both targets to zero and ramps
+    /// down at the configured rate, preserving the current ramp state.
+    /// Ordinary [`drive`](Self::drive) is persistent.
+    ///
+    /// # Errors
+    /// Rejects zero/overflowing durations, invalid demands, a deadline elapsed
+    /// before admission, shutdown and latched faults through existing errors.
+    pub async fn drive_for(
+        &self,
+        left: f32,
+        right: f32,
+        duration: Duration,
+    ) -> Result<(), RobotError> {
+        let deadline = Instant::now()
+            .checked_add(duration)
+            .filter(|_| !duration.is_zero())
+            .ok_or_else(|| {
+                MotorError::Pwm("drive duration must be positive and representable".into())
+            })?;
+        if self.drive_until(left, right, deadline.into_std()).await? {
+            Ok(())
+        } else {
+            Err(MotorError::Pwm("drive deadline elapsed before admission".into()).into())
+        }
+    }
+
+    /// Accept fresh intent with an absolute monotonic deadline. Queues must
+    /// preserve the original deadline. Returns `false` if it has already elapsed,
+    /// without replacing the current demand. Fresh intent ramps from the current
+    /// output demand, including when a previous command is decelerating.
+    ///
+    /// # Errors
+    /// Returns existing errors for invalid demands, shutdown or latched faults.
+    pub async fn drive_until(
+        &self,
+        left: f32,
+        right: f32,
+        deadline: std::time::Instant,
+    ) -> Result<bool, RobotError> {
+        self.set_finite(left, right, Instant::from_std(deadline), false)
+            .await
+    }
+
+    /// Renew only an active, unexpired finite command. Returns `false` for an
+    /// expired deadline or missing/expired lease; a late renewal cannot restart
+    /// motion. This check and paired target replacement share one lock.
+    ///
+    /// # Errors
+    /// Returns existing errors for invalid demands, shutdown or latched faults.
+    pub async fn renew_until(
+        &self,
+        left: f32,
+        right: f32,
+        deadline: std::time::Instant,
+    ) -> Result<bool, RobotError> {
+        self.set_finite(left, right, Instant::from_std(deadline), true)
+            .await
+    }
+
+    async fn set_finite(
+        &self,
+        left: f32,
+        right: f32,
+        deadline: Instant,
+        renew: bool,
+    ) -> Result<bool, RobotError> {
+        let mut control = self.state.control.lock().await;
+        control.check_admission(self.state.cancel_token.is_cancelled())?;
+        if !left.is_finite() || !right.is_finite() {
+            return Err(MotorError::Pwm("finite drive demands must be finite".into()).into());
+        }
+        let now = Instant::now();
+        control.expire_if_due(now);
+        self.state.wake.notify_one();
+        if deadline <= now || (renew && control.expires.is_none()) {
+            return Ok(false);
+        }
+        control.targets = (
+            scaled_demand(left, self.state.config.left_motor_factor),
+            scaled_demand(right, self.state.config.right_motor_factor),
+        );
+        control.expires = Some(deadline);
+        debug!(
+            left,
+            right,
+            ?deadline,
+            renew,
+            "finite drive target accepted"
+        );
+        Ok(true)
     }
 
     /// Atomically set both target speeds to zero (motors ramp down independently).
@@ -318,8 +430,11 @@ impl Robot {
         let mut control = self.state.control.lock().await;
         control.check_admission(self.state.cancel_token.is_cancelled())?;
 
+        control.expire_if_due(Instant::now());
+        control.expires = None;
         control.targets = (0.0, 0.0);
         drop(control);
+        self.state.wake.notify_one();
 
         debug!("stop requested");
         Ok(())
@@ -412,6 +527,23 @@ impl RobotState {
         control.status.cleanup_complete = true;
     }
 
+    async fn advance_deadline(
+        &self,
+        deadline: Option<Instant>,
+        interval: Duration,
+        now: Instant,
+    ) -> Option<Instant> {
+        if let Some(tick) = deadline.filter(|tick| *tick <= now) {
+            let (next, skipped) = next_tick(tick, interval, now);
+            let mut control = self.control.lock().await;
+            control.status.timing.skipped_ticks =
+                control.status.timing.skipped_ticks.saturating_add(skipped);
+            next
+        } else {
+            deadline
+        }
+    }
+
     async fn smooth_motor_adjustment(self: Arc<Self>) {
         let mut current_left_speed: f32 = 0.0;
         let mut current_right_speed: f32 = 0.0;
@@ -423,13 +555,21 @@ impl RobotState {
         let mut deadline = previous_update.checked_add(interval);
 
         loop {
+            let wake_at = {
+                let control = self.control.lock().await;
+                match (deadline, control.expires) {
+                    (Some(tick), Some(expiry)) => Some(tick.min(expiry)),
+                    (tick, expiry) => tick.or(expiry),
+                }
+            };
             tokio::select! {
                 biased;
                 () = self.cancel_token.cancelled() => {
                     debug!("motor adjustment task cancelled");
                     break;
                 }
-                () = wait_for_tick(deadline) => {}
+                () = self.wake.notified() => {},
+                () = wait_for_tick(wake_at) => {}
             }
 
             let motor_board = tokio::select! {
@@ -445,6 +585,12 @@ impl RobotState {
                 break;
             }
             let now = Instant::now();
+            control.expire_if_due(now);
+            // Command notifications reschedule expiry; they never accelerate
+            // the ordinary ramp tick or turn a delayed tick into a burst.
+            if deadline.is_none_or(|tick| now < tick) {
+                continue;
+            }
             let elapsed = now.duration_since(previous_update);
             previous_update = now;
             control.status.timing.record_elapsed(elapsed, interval);
@@ -482,13 +628,9 @@ impl RobotState {
             }
             drop(motor_board);
 
-            let mut control = self.control.lock().await;
-            if let Some(previous_deadline) = deadline {
-                let (next, skipped) = next_tick(previous_deadline, interval, Instant::now());
-                deadline = next;
-                control.status.timing.skipped_ticks =
-                    control.status.timing.skipped_ticks.saturating_add(skipped);
-            }
+            deadline = self
+                .advance_deadline(deadline, interval, Instant::now())
+                .await;
         }
     }
 }
@@ -602,6 +744,8 @@ fn apply_motor_speed(
 #[cfg(test)]
 mod lifecycle_tests;
 
+#[cfg(test)]
+mod expiry_tests;
 #[cfg(test)]
 mod timing_tests;
 
@@ -870,7 +1014,7 @@ mod tests {
     }
 
     // Poll once to deterministically enqueue a waiter on the held state lock.
-    async fn assert_pending<F: std::future::Future>(mut future: std::pin::Pin<&mut F>) {
+    pub(super) async fn assert_pending<F: std::future::Future>(mut future: std::pin::Pin<&mut F>) {
         std::future::poll_fn(|cx| {
             assert!(future.as_mut().poll(cx).is_pending());
             std::task::Poll::Ready(())

@@ -123,6 +123,7 @@ A background output failure now closes command admission, clears both pending ta
 | `cleanup_error` | Final stop failure, stored separately from the original fault |
 | `cleanup_complete` | Cleanup finished, even when its stop attempt failed |
 | `timing` | Bounded elapsed-time and skipped-tick diagnostics, added in 0.1.7 |
+| `expired_commands` | Detected finite-command expirations; saturates at `u64::MAX` (0.1.10) |
 
 The two optional diagnostics each retain at most 4096 UTF-8 bytes, including a truncation marker if needed. Rejected commands do not grow an error history. The new types are exported as `RobotStatus`, `RobotPhase` and `RobotOutputState`; existing error enums and config fields are unchanged.
 
@@ -144,6 +145,24 @@ Elapsed time is capped at one configured interval: no update changes power by mo
 | `max_elapsed` | Largest observed update spacing, also uncapped |
 
 Counters saturate at `u64::MAX`; there is no growing history or per-overrun warning stream. Durations start at zero and diagnostics remain available after shutdown or a fault. Overruns alone do not latch a fault in this release. These are controller timing observations, not wheel-speed measurements or a real-time stopping guarantee.
+
+### Finite commands and smooth stopping (0.1.10)
+
+Ordinary `drive(left, right)` remains persistent. `drive_for(left, right, duration)` opts into a finite command; its deadline starts when the async call is polled, before waiting for the control lock. Duration must be positive and representable. Neither `RobotConfig` nor existing error enum variants change.
+
+```rust,ignore
+robot.drive_for(0.5, 0.5, std::time::Duration::from_millis(500)).await?;
+// Without renewal, smooth deceleration begins at the deadline.
+robot.stop().await?; // Optional earlier smooth stop; controller stays usable.
+```
+
+For queues, capture a `std::time::Instant` deadline at receipt and pass it unchanged to `drive_until(left, right, deadline)`. It returns `Ok(false)` if that deadline already elapsed. `renew_until` atomically checks that an existing finite command is still active and unexpired before replacing its paired targets/deadline; `Ok(false)` means renewal was rejected and must not be retried as fresh intent. Invalid demands and controller faults use the existing errors. These methods accept targets, not confirmed motor motion.
+
+The robot task wakes for the earlier of a ramp tick or lease deadline and rechecks expiry after lock waits. Expiry clears both targets and preserves the current ramp state, so subsequent ticks decelerate at the configured rate, just like `stop()`. A fresh `drive`/`drive_for`/`drive_until` can change the target while decelerating; a late renewal cannot. Output failures latch a fault and run the existing cleanup. `expired_commands` records detected expirations without an error history. Expiry itself is not a fault.
+
+`stop()` accepts zero targets and cancels an unexpired finite lease; it returns without waiting for the ramp to finish. `drive()` replaces an unexpired lease with persistent intent. Output status stays conservatively `Unknown` while running; it is not mechanical feedback. Shutdown and fault cleanup retain their existing output-off behavior.
+
+The deadline determines when deceleration is requested, not when outputs reach zero. Ramp duration depends on current demand and the configured rate; executor scheduling, in-flight output batches and blocked I/O can add delay. Expiry detection is independent of the ramp elapsed-time cap, but this is best-effort software behavior, not an independent hardware watchdog or a guarantee of physical stopping time.
 
 ## Examples
 
@@ -173,26 +192,26 @@ Then open `http://<robot-ip>:8000` in a browser for the joystick control UI.
 |----------|--------|-------------|
 | `/` | GET | Web UI with dual joystick control |
 | `/ws` | WebSocket | Drive commands (`{"left": 0.5, "right": 0.5}`); one controlling session |
-| `/drive?left=0.5&right=0.5` | GET | Drive command when no WebSocket owner holds control |
+| `/drive?left=0.5&right=0.5` | GET | 500 ms drive command when no WebSocket owner holds control |
 | `/health` | GET | JSON controller state; 200 running, 503 shutting down/shutdown/faulted |
 
 Since v0.1.8, `/health` replaces the unconditional `Healthy` text response with JSON. A normal running response is:
 
 ```json
-{"phase":"Running","output":"Unknown","fault":null,"cleanup_error":null,"cleanup_complete":false}
+{"phase":"Running","output":"Unknown","fault":null,"cleanup_error":null,"cleanup_complete":false,"expired_commands":0}
 ```
 
 This reports lifecycle and output certainty, not a hardware self-test or sensed motion. A fault remains unhealthy even if cleanup successfully stopped the outputs. During shutdown, the endpoint may briefly report 503 before the server closes its connections; it is unavailable once the server exits.
 
-The web example retains the robot until server completion and awaits cleanup on bind/serve failure, Ctrl-C and SIGTERM. On a shutdown signal it closes motion admission and finishes robot shutdown before stopping HTTP workers, so open WebSockets do not postpone motor cleanup. The default log filter includes the final `robot cleanup completed` status and fault/cleanup warnings. The original server error is preserved if cleanup also fails; a cleanup/controller failure otherwise produces an error exit. SIGKILL, power loss and indefinitely blocked I/O cannot be handled by this shutdown path. Finite command expiry remains a later checkpoint.
+The web example retains the robot until server completion and awaits cleanup on bind/serve failure, Ctrl-C and SIGTERM. On a shutdown signal it closes motion admission and finishes robot shutdown before stopping HTTP workers, so open WebSockets do not postpone motor cleanup. The default log filter includes the final `robot cleanup completed` status and fault/cleanup warnings. The original server error is preserved if cleanup also fails; a cleanup/controller failure otherwise produces an error exit. SIGKILL, power loss and indefinitely blocked I/O cannot be handled by this shutdown path. Finite command expiry is enforced by the controller as of v0.1.10.
 
-#### Ordered web control and ownership (v0.1.9)
+#### Ordered web control and ownership (v0.1.9–v0.1.10)
 
-Opening a WebSocket does not claim control. Its first valid, admitted left/right command claims ownership until disconnect, including when the owner commands zero. Additional sessions can connect, but their drive/stop requests receive `busy`; closing a non-owner session does not stop the robot. HTTP commands, including zero demand, are also rejected while a WebSocket owns control. This coordinates clients of one server, not separate processes opening the board.
+Opening a WebSocket does not claim control. Its first valid, admitted left/right command claims ownership until disconnect or lease expiry, including when the owner commands zero (zero stops renewal but retains ownership while connected). Additional sessions can connect, but their drive/stop requests receive `busy`; closing a non-owner session does not stop the robot. HTTP commands, including zero demand, are also rejected while a WebSocket owns control. This coordinates clients of one server, not separate processes opening the board.
 
-One worker applies admitted commands in order through `Robot`. At most 32 ordinary commands wait, plus one in-flight command and one reserved pending stop. Queue overflow rejects the new command without claiming ownership. A zero/zero command uses the reserved stop slot and cancels older queued commands with `superseded`; repeated pending stops coalesce. Later admitted commands run after the stop. These stops use ordinary ramp-to-zero behavior.
+One worker applies admitted commands in order through `Robot`. At most 32 ordinary commands wait, plus one in-flight command and one reserved pending stop. Queue overflow rejects the new command without claiming ownership. A zero/zero command uses the reserved stop slot and cancels older queued commands with `superseded`; repeated pending stops coalesce. Later admitted commands run after the stop. These stops use `Robot::stop()` to accept zero targets and ramp down smoothly; acceptance does not wait for deceleration to finish.
 
-Owner disconnect cancels all pending commands with `disconnected` and requests a priority smooth stop after any in-flight command. New ownership and HTTP commands are blocked until that stop target is accepted by `Robot`, which does not mean the ramp or mechanical stopping has finished. A new session must submit a fresh command; queued commands from the old session cannot restart motion. Malformed, non-finite or unsupported WebSocket messages close the offending session and release any ownership. Invalid HTTP requests do not acquire ownership or affect an existing owner.
+Owner disconnect cancels all pending commands with `disconnected` and requests a priority smooth stop after any in-flight command. New ownership and HTTP commands are blocked until the zero targets are accepted, which does not wait for deceleration or establish mechanical standstill. A new session must submit a fresh command; queued commands from the old session cannot restart motion. Malformed, non-finite or unsupported WebSocket messages close the offending session and release any ownership. Invalid HTTP requests do not acquire ownership or affect an existing owner.
 
 WebSocket connections initially receive `{"status":"ready"}`. Successful command acknowledgements and HTTP responses use `{"status":"accepted"}`; this confirms target acceptance, not hardware application. Errors use JSON such as `{"code":"busy","error":"..."}`. The example's HTTP success body therefore changes from `Driving` to JSON in this release:
 
@@ -201,10 +220,13 @@ WebSocket connections initially receive `{"status":"ready"}`. Successful command
 | 400 | `invalid` | Missing, malformed or non-finite input |
 | 409 | `busy` | Another session owns control, or owner release is pending |
 | 409 | `superseded`, `disconnected` | A previously queued command was cancelled |
+| 409 | `expired` | Command/session lease expired; reconnect with fresh input |
 | 429 | `queue_full` | Waiting command capacity exhausted |
 | 503 | `fault`, `shutdown` | Controller failure or closed command admission |
 
-The browser displays ownership/errors and clears local demands on rejection or connection loss. A busy response does not retry the rejected command; another deliberate joystick action can try again after the owner releases control. On overload or controller errors, the browser closes its stream to release ownership; reload and give fresh input to reconnect. No automatic command replay or heartbeat is added. Commands, including HTTP commands, remain persistent, and a silently broken connection may retain ownership and motion until the server detects its closure. Finite expiry belongs to v0.1.10.
+The browser displays ownership/errors and clears local demands on rejection or connection loss. A busy response does not retry the rejected command; another deliberate joystick action can try again after the owner releases control. On overload or controller errors, the browser closes its stream to release ownership; reload and give fresh input to reconnect. As of v0.1.10, all nonzero web commands receive a 500 ms lifetime measured from server receipt. The original deadline travels through the queue. The worker renews only an unexpired controller lease; a late queued renewal cannot acquire a fresh lease. Expiry invalidates the session and all its pending commands, even queued renewals with later deadlines. HTTP uses the same rule, so a one-shot request stops without another request. A new HTTP request after release is fresh intent; an expired WebSocket must reconnect before new input can drive.
+
+The matching browser sends the current demand every 100 ms while a nonzero joystick demand is active, including when held unchanged. Release sends zero for the released axis immediately; zero on both axes starts smooth deceleration and ends renewal. Hiding the tab, losing focus or leaving the page clears both axes, ends renewal and sends zero if connected. Connection loss clears local intent; returning focus/visibility does not resume it. A new joystick start is required. A heartbeat callback delayed by 500 ms or more closes the connection instead of replaying stale demand. An expired or disconnected session requires reload/reconnection and fresh input. Protocol ping/pong, invalid input and spectator traffic never renew motion. Deploy the server and browser files together and reload cached pages.
 
 #### Architecture (web server example)
 
@@ -345,7 +367,7 @@ curl -i http://127.0.0.1:8000/health
 curl --fail 'http://127.0.0.1:8000/drive?left=0.25&right=0.25'
 ```
 
-Expect HTTP 200 with `phase: Running`, `output: Unknown`, and null fault/cleanup diagnostics. Press Ctrl-C in the server terminal while motion is commanded. Expect `robot cleanup completed` with `Shutdown`, `Stopped`, `cleanup_complete: true`, and no fault/cleanup error, before the process exits. Confirm outputs remain off after exit. Repeat with a browser WebSocket open if desired; the server should not wait for the browser to disconnect before stopping the robot. These web commands remain persistent in v0.1.8, so terminate the server promptly after checking motion.
+Expect HTTP 200 with `phase: Running`, `output: Unknown`, and null fault/cleanup diagnostics. Press Ctrl-C in the server terminal while motion is commanded. Expect `robot cleanup completed` with `Shutdown`, `Stopped`, `cleanup_complete: true`, and no fault/cleanup error, before the process exits. Confirm outputs remain off after exit. Repeat with a browser WebSocket open if desired; the server should not wait for the browser to disconnect before stopping the robot. In v0.1.10, one-shot HTTP commands expire after 500 ms. To check termination during sustained motion, keep a joystick held in a focused browser on another device while signaling the server.
 
 After the first server has exited, repeat using SIGTERM. In one terminal:
 
@@ -372,12 +394,12 @@ python3 -m http.server 8000 --bind 127.0.0.1
 
 Leave that process running and, in a second terminal, start the web example on the same address/port using the foreground command above. Expect a nonzero exit with the original address-in-use error, preceded by completed robot cleanup with `Shutdown`/`Stopped` and no cleanup errors. No drive command is needed; verify the motors stay off. Stop the Python server with Ctrl-C afterward. Do not use a second robot web server to occupy the port. Serve failures and background driver faults are covered by mocks; do not induce live wiring faults.
 
-#### Web ownership verification (v0.1.9)
+#### Web ownership verification (v0.1.9–v0.1.10)
 
-Repeat the controller baseline and v0.1.8 lifecycle checks first. Keep tracks lifted, use your previously accepted modest power and factors, and keep the power cutoff accessible. Start one web server, then open two tabs (A and B) at its UI. Reload both tabs to load the matching v0.1.9 browser files.
+Repeat the controller baseline and v0.1.8 lifecycle checks first. Keep tracks lifted, use your previously accepted modest power and factors, and keep the power cutoff accessible. Start one web server, then open two tabs (A and B) at its UI. Reload both tabs to load the matching browser files. In v0.1.10 use two devices when checking non-owner actions during motion, because switching focus away from the controlling page now stops its demand.
 
-1. Move a joystick in A. It should report that you control the robot. Releasing the joystick commands smooth zero but retains ownership.
-2. Try the joysticks in B: it should report that another client controls the robot, and must not change the outputs. Closing B must not stop A's motion. To hold a modest demand while switching tabs, you can use A's browser console: `sendDriveCommand(0.25, 0.25)`, followed promptly by `sendDriveCommand(0, 0)` to stop. Use your accepted power; commands do not expire yet.
+1. Move a joystick in A. It should report that you control the robot. Releasing both joysticks immediately requests zero targets, ramps down smoothly and retains ownership.
+2. Try the joysticks in B: it should report that another client controls the robot, and must not change the outputs. Closing B must not stop A's motion. Keep A focused with a joystick held at modest power on one device while operating B on another. Switching away from A intentionally stops demand in v0.1.10.
 3. While A owns control, run the HTTP requests below on the robot host. Both must return HTTP 409 with `code: busy` and leave A's target unchanged, including the zero request.
 
 ```bash
@@ -385,11 +407,42 @@ curl -i 'http://127.0.0.1:8000/drive?left=0.25&right=0.25'
 curl -i 'http://127.0.0.1:8000/drive?left=0&right=0'
 ```
 
-4. With a modest command active in A, close A. Expect the ordinary smooth stop. Reopen a tab: connection alone must not start motion. Deliberate new input can claim control after the previous stop request is accepted.
+4. With a modest command active in A, close A. Expect a smooth ramp down to zero. Reopen a tab: connection alone must not start motion. Deliberate new input can claim control after the previous smooth-stop request is accepted.
 5. Close all controlling tabs. Repeat the two HTTP requests in order, promptly issuing zero after the motion check. Expect HTTP 200 and `status: accepted` for both. Also try a missing or invalid parameter: expect HTTP 400 JSON without changing demand.
 6. Finish with Ctrl-C or SIGTERM and confirm the v0.1.8 completed-cleanup status and outputs remaining off.
 
-Do not use network disconnection to test expiry in this version, and do not flood the real robot to test overflow. Queue saturation, stale-command rejection and artificial delays are covered by mocks. Record which tab owned control, observed busy responses and stop behavior.
+Use the bounded expiry checks below for loss of renewal; do not flood the real robot to test overflow. Queue saturation, stale-command rejection and artificial delays are covered by mocks. Record which tab owned control, observed busy responses and stop behavior.
+
+#### Web expiry verification (v0.1.10)
+
+Keep the same lifted-track setup, accepted power/factors and accessible cutoff. Start only one controller, with the matching browser assets. Debug logs provide timestamped `finite drive target accepted` and `finite drive expired; smooth stop requested` events. Expiry logs mark the request to decelerate, not completed output writes or measured standstill:
+
+```bash
+RUST_LOG=robot_control=debug,web_server=info \
+  cargo run --example web_server --features pca9685 -- --host 0.0.0.0 --port 8000
+```
+
+1. Hold an unchanged joystick at modest power for more than one second. Requests should continue about every 100 ms and motion should remain commanded. Release both joysticks: expect smooth deceleration to zero and no further renewals. Closing a controlling tab should also ramp down smoothly, as in v0.1.9.
+2. While holding demand, hide the page or change focus. Expect smooth deceleration, cleared local demand and stopped renewal. Return to the page without touching a joystick: it must remain stopped. Release any old gesture and start a fresh gesture to move again. Repeat on mobile by switching apps.
+3. With all controlling tabs closed, send one modest HTTP command from another terminal. Do not send zero; observe automatic deceleration beginning around the original 500 ms deadline, followed by zero output. Read `/health` afterward: expect `Running`, no fault, and an increased `expired_commands` count. Motion must stay off until new explicit input.
+
+```bash
+curl -i 'http://127.0.0.1:8000/drive?left=0.25&right=0.25'
+curl -i http://127.0.0.1:8000/health
+```
+
+4. To check loss of WebSocket renewal without deliberately disconnecting hardware, close the normal controlling page and open a fresh page's developer console. The normal UI connection does not own control until it sends a command. Run this bounded one-shot WebSocket test (choose your accepted power):
+
+```javascript
+const expirySocket = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws`);
+expirySocket.onmessage = event => console.log(event.data);
+expirySocket.onopen = () => expirySocket.send(JSON.stringify({ left: 0.25, right: 0.25 }));
+```
+
+Do not add a renewal timer. Expect one accepted target and smooth deceleration starting after about 500 ms. After observing that stop, send the same command once more on `expirySocket`: expect `expired` and no movement. Close it with `expirySocket.close()`. Reload the UI and confirm connection/focus alone does not move the robot; fresh input is needed. Alternatively interrupt only the controlling browser's network connection with a second operator at the cutoff, then verify no restart on reconnection.
+
+5. Record the interval between the last accepted target and `finite drive expired; smooth stop requested`, and record the observed deceleration separately. Allow for queued receipt time, ramp duration and scheduler/I/O load; this is not a guarantee of physical standstill within 500 ms. A queued late command must never receive a fresh 500 ms lease. Queue-delay races and stop-write failures remain automated mock tests.
+6. End with Ctrl-C/SIGTERM and verify completed shutdown. Stop and investigate unexpected continued motion, automatic restart or driver errors.
 
 Record version, board/bus/address, wiring, factors, requested power, observed stopping times and pass/fail results. End the test with the power cutoff and investigate unexpected direction, loss of control, driver errors or motion after shutdown. Inject bus faults only in the automated mocks; do not unplug powered motor wiring. These observations supplement the mock race tests and do not establish mechanical standstill.
 

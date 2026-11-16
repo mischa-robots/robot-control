@@ -7,6 +7,27 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## Unreleased
 
+## 0.1.10
+
+### Added
+
+- Opt-in finite library commands: `drive_for`, absolute-deadline `drive_until`, and atomic `renew_until`. Deadlines and paired targets share the command lock; late renewals cannot restart expired motion. Existing persistent `drive`, config literals and error enum variants remain compatible.
+- Controller-enforced expiry independent of the ramp interval/cap: clear targets while preserving ramp state, then decelerate at the configured rate. Fresh explicit intent continues from the current ramp state; late renewal cannot revive expired intent.
+- Saturating `RobotStatus::expired_commands`, also exposed by `/health`, and debug logs for finite acceptance and expiry requesting a smooth stop.
+
+### Changed
+
+- WebSocket and HTTP motion commands now have 500 ms leases measured from receipt, carried unchanged through the queue. Expiry invalidates the session and pending commands, including later queued renewals. An expired WebSocket must reconnect with fresh input.
+- Web zero-demand stops, owner disconnect and lease expiry all use smooth deceleration, preserving the existing `Robot::stop` behavior. Shutdown and fault cleanup retain their output-off behavior.
+- The browser renews nonzero demand every 100 ms, including unchanged joystick input. Release sends zero immediately; focus loss, hiding and connection loss clear demand and stop renewal. Focus/visibility/reconnection never replay old input. A delayed heartbeat closes the connection instead of reviving stale demand.
+
+### Tests and verification
+
+- Controlled-time tests cover expiry, original queued deadlines, late renewals, invalid/spectator traffic, new intent after expiry, lock waits, smooth stop/expiry equivalence, stop failure, disconnect and HTTP expiry and persistent-drive compatibility.
+- Browser tests cover renewal timing, release, focus/visibility changes, connection loss and delayed callbacks; operator procedures cover one-shot and interrupted renewal checks.
+
+Deploy server and browser files together. Defaults, wiring and successful electrical stop writes remain unchanged. The 500 ms expiry starts deceleration; reaching zero additionally takes ramp time. Software expiry cannot interrupt blocked I/O or guarantee mechanical stopping within 500 ms.
+
 ## 0.1.9
 
 ### Fixed

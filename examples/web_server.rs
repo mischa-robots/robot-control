@@ -208,6 +208,7 @@ async fn health_check(robot: web::Data<Arc<Robot>>) -> HttpResponse {
         "fault": status.fault,
         "cleanup_error": status.cleanup_error,
         "cleanup_complete": status.cleanup_complete,
+        "expired_commands": status.expired_commands,
     }))
 }
 
@@ -228,7 +229,7 @@ async fn robot_ws(
 fn control_error_response(error: &ControlError) -> HttpResponse {
     let mut response = match error.code {
         "invalid" => HttpResponse::BadRequest(),
-        "busy" | "superseded" | "disconnected" => HttpResponse::Conflict(),
+        "busy" | "superseded" | "disconnected" | "expired" => HttpResponse::Conflict(),
         "queue_full" => HttpResponse::TooManyRequests(),
         _ => HttpResponse::ServiceUnavailable(),
     };

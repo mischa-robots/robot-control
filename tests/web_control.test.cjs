@@ -12,9 +12,36 @@ function fixture(protocol = 'http:') {
     }
     let status;
     let resets = 0;
+    let clock = 0;
+    let nextId = 0;
+    const timers = new Map();
+    const listeners = {};
+    const environment = {
+        performance: { now: () => clock },
+        document: { hidden: false, hasFocus: () => true,
+            addEventListener: (name, callback) => { listeners[name] = callback; } },
+        addEventListener: (name, callback) => { listeners[name] = callback; },
+        setInterval(callback, period) { timers.set(++nextId, { callback, period, next: clock + period }); return nextId; },
+        clearInterval(id) { timers.delete(id); },
+    };
+    function advance(ms) {
+        const end = clock + ms;
+        while (true) {
+            const next = [...timers.values()].sort((a, b) => a.next - b.next)[0];
+            if (!next || next.next > end) break;
+            clock = next.next;
+            next.next += next.period;
+            next.callback();
+        }
+        clock = end;
+    }
+    function stall(ms) {
+        clock += ms;
+        for (const timer of [...timers.values()]) timer.callback();
+    }
     const connection = connectRobot(WebSocket, { protocol, host: 'robot.local:8080' },
-        value => { status = value; }, () => { resets++; });
-    return { connection, socket, status: () => status, resets: () => resets };
+        value => { status = value; }, () => { resets++; }, environment);
+    return { connection, socket, status: () => status, resets: () => resets, advance, stall, listeners, environment, timers };
 }
 
 test('URL preserves scheme/host/port; no disconnected sends or automatic demand replay', (t) => {
@@ -85,4 +112,76 @@ test('superseded commands stay quiet; malformed replies and connection errors ar
     f.socket.onerror(event);
     assert.equal(errors.mock.callCount(), 2);
     assert.equal(errors.mock.calls[1].arguments[1], event);
+});
+
+test('unchanged held input renews every 100 ms; release sends zero and ends renewal', () => {
+    const f = fixture();
+    f.socket.readyState = 1;
+    f.socket.onopen();
+    f.connection.startInput('left');
+    f.connection.moveInput('left', 0.4);
+    f.advance(1100);
+    assert.equal(f.socket.sent.length, 12);
+    assert.ok(f.socket.sent.every(value => value.left === 0.4 && value.right === 0));
+    f.connection.endInput('left');
+    assert.deepEqual(f.socket.sent.at(-1), { left: 0, right: 0 });
+    const count = f.socket.sent.length;
+    f.advance(1000);
+    assert.equal(f.socket.sent.length, count);
+    assert.equal(f.timers.size, 0);
+});
+
+test('hiding or blurring clears both axes; focus/visibility and old gestures do not resume', () => {
+    for (const event of ['blur', 'visibilitychange', 'pagehide']) {
+        const f = fixture();
+        f.socket.readyState = 1;
+        f.connection.startInput('left');
+        f.connection.startInput('right');
+        f.connection.moveInput('left', 0.4);
+        f.connection.moveInput('right', 0.5);
+        if (event === 'visibilitychange') f.environment.document.hidden = true;
+        f.listeners[event]();
+        assert.deepEqual(f.socket.sent.at(-1), { left: 0, right: 0 });
+        const count = f.socket.sent.length;
+        f.advance(1000);
+        f.environment.document.hidden = false;
+        f.listeners.visibilitychange();
+        f.listeners.focus();
+        f.connection.moveInput('left', 0.8);
+        f.connection.endInput('right');
+        f.advance(1000);
+        assert.equal(f.socket.sent.length, count);
+        f.connection.startInput('left');
+        f.connection.moveInput('left', 0.2);
+        assert.deepEqual(f.socket.sent.at(-1), { left: 0.2, right: 0 });
+    }
+});
+
+test('a delayed heartbeat closes instead of replaying a stale nonzero demand', (t) => {
+    t.mock.method(console, 'error', () => {});
+    const f = fixture();
+    f.socket.readyState = 1;
+    f.connection.sendDriveCommand(0.4, 0.4);
+    f.stall(500);
+    assert.equal(f.socket.sent.length, 1);
+    assert.equal(f.socket.readyState, 3);
+    assert.equal(f.timers.size, 0);
+    assert.match(f.status(), /renewal paused/);
+});
+
+test('busy, expiry and connection loss cancel renewal; acceptance cannot revive it', (t) => {
+    t.mock.method(console, 'error', () => {});
+    for (const code of ['busy', 'expired', 'connection']) {
+        const f = fixture();
+        f.socket.readyState = 1;
+        f.connection.startInput('left');
+        f.connection.moveInput('left', 0.4);
+        if (code === 'connection') f.socket.onerror({ type: 'error' });
+        else f.socket.onmessage({ data: JSON.stringify({ code, error: code }) });
+        f.socket.onmessage({ data: JSON.stringify({ status: 'accepted' }) });
+        f.advance(1000);
+        assert.equal(f.socket.sent.length, 1);
+        assert.equal(f.timers.size, 0);
+        assert.equal(f.connection.moveInput('left', 0.8), false);
+    }
 });

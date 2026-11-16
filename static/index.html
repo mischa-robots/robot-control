@@ -42,7 +42,7 @@
         const leftJoystick = document.getElementById('leftJoystick');
         const rightJoystick = document.getElementById('rightJoystick');
 
-        const { sendDriveCommand } = connectRobot(
+        const { sendDriveCommand, startInput, moveInput, endInput } = connectRobot(
             WebSocket, location,
             (message) => { document.getElementById('controlStatus').textContent = message; },
             () => { leftJoystick.value = 0; rightJoystick.value = 0; }
@@ -62,27 +62,16 @@
             color: 'red'
         });
 
+        leftNipple.on('start', () => startInput('left'));
+        rightNipple.on('start', () => startInput('right'));
         leftNipple.on('move', (evt, data) => {
-            const value = Math.max(-1, Math.min(1, data.vector.y));
-            sendDriveCommand(value, rightJoystick.value || 0);
-            leftJoystick.value = value;
+            moveInput('left', Math.max(-1, Math.min(1, data.vector.y)));
         });
-
         rightNipple.on('move', (evt, data) => {
-            const value = Math.max(-1, Math.min(1, data.vector.y));
-            sendDriveCommand(leftJoystick.value || 0, value);
-            rightJoystick.value = value;
+            moveInput('right', Math.max(-1, Math.min(1, data.vector.y)));
         });
-
-        leftNipple.on('end', () => {
-            leftJoystick.value = 0;
-            sendDriveCommand(0, rightJoystick.value || 0);
-        });
-
-        rightNipple.on('end', () => {
-            rightJoystick.value = 0;
-            sendDriveCommand(leftJoystick.value || 0, 0);
-        });
+        leftNipple.on('end', () => endInput('left'));
+        rightNipple.on('end', () => endInput('right'));
     </script>
 </body>
 </html>

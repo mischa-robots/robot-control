@@ -1,6 +1,6 @@
 use super::*;
 use actix_web::{http::StatusCode, test as http_test};
-use control::{CommandTarget, QUEUE_CAPACITY, Receipt};
+use control::{CommandTarget, DriveRequest, QUEUE_CAPACITY, Receipt};
 use std::time::Duration;
 use tokio::{
     sync::{mpsc, oneshot},
@@ -9,14 +9,21 @@ use tokio::{
 
 struct Call {
     params: Option<DriveParams>,
+    request: Option<DriveRequest>,
     finish: oneshot::Sender<Result<(), ControlError>>,
 }
 
 struct Target(mpsc::UnboundedSender<Call>);
 impl CommandTarget for Target {
-    async fn apply(&self, params: Option<DriveParams>) -> Result<(), ControlError> {
+    async fn apply(&self, request: Option<DriveRequest>) -> Result<(), ControlError> {
         let (finish, receipt) = oneshot::channel();
-        self.0.send(Call { params, finish }).unwrap();
+        self.0
+            .send(Call {
+                params: request.map(|request| request.params),
+                request,
+                finish,
+            })
+            .unwrap();
         receipt.await.unwrap()
     }
 }
@@ -389,7 +396,7 @@ impl MotorDriver for RecordingMotor {
 }
 
 #[tokio::test(start_paused = true)]
-async fn real_robot_target_preserves_smooth_stop_and_reports_shutdown() {
+async fn real_robot_target_stops_smoothly_and_reports_shutdown() {
     let (send, mut outputs) = mpsc::unbounded_channel();
     let robot = Robot::new(
         Arc::new(Mutex::new(RecordingMotor(send))),
@@ -419,13 +426,232 @@ async fn real_robot_target_preserves_smooth_stop_and_reports_shutdown() {
     accepted(control.submit(Some(&owner), demand(0.0)).unwrap()).await;
     tokio::time::advance(Duration::from_millis(10)).await;
     let ramped = outputs.recv().await.unwrap();
-    assert!(ramped > 0 && ramped < previous); // Ordinary slew, not immediate off.
+    assert!(ramped > 0 && ramped < previous);
     assert_eq!(outputs.recv().await.unwrap(), ramped);
     robot.shutdown().await;
     let error = receipt_result(control.submit(Some(&owner), demand(0.5)).unwrap())
         .await
         .unwrap_err();
     assert_eq!(error.code, "shutdown");
+    control.close();
+    worker.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn queued_deadlines_keep_receipt_time_and_renew_only_an_active_lease() {
+    use tokio::time::{Instant, advance};
+    let mut rig = Rig::new();
+    let started = Instant::now();
+    let first = rig.control.submit(None, demand(0.2)).unwrap();
+    let blocked = rig.next().await;
+    assert!(!blocked.request.unwrap().renew);
+    advance(Duration::from_millis(100)).await;
+    let second = rig.control.submit(None, demand(0.4)).unwrap();
+    blocked.finish.send(Ok(())).unwrap();
+    accepted(first).await;
+    advance(Duration::from_millis(100)).await;
+    let next = rig.next().await;
+    let request = next.request.unwrap();
+    assert!(request.renew);
+    assert_eq!(request.deadline, started + Duration::from_millis(600));
+    next.finish.send(Ok(())).unwrap();
+    accepted(second).await;
+    advance(Duration::from_millis(399)).await;
+    assert!(rig.calls.try_recv().is_err());
+    advance(Duration::from_millis(1)).await;
+    let stop = rig.next().await;
+    assert!(stop.params.is_none());
+    stop.finish.send(Ok(())).unwrap();
+    rig.finish().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn expiry_discards_even_unexpired_queued_renewals_and_revokes_old_session() {
+    let mut rig = Rig::new();
+    let owner = Session::new();
+    let first = rig.control.submit(Some(&owner), demand(0.2)).unwrap();
+    let blocked = rig.next().await;
+    tokio::time::advance(Duration::from_millis(400)).await;
+    let queued = rig.control.submit(Some(&owner), demand(0.4)).unwrap();
+    tokio::time::advance(Duration::from_millis(101)).await;
+    blocked.finish.send(Ok(())).unwrap();
+    for receipt in [first, queued] {
+        assert_eq!(receipt_result(receipt).await.unwrap_err().code, "expired");
+    }
+    assert_eq!(
+        rig.control
+            .submit(Some(&owner), demand(0.5))
+            .unwrap_err()
+            .code,
+        "expired"
+    );
+    let stop = rig.next().await;
+    assert!(stop.params.is_none());
+    assert_eq!(
+        rig.control.submit(None, demand(0.5)).unwrap_err().code,
+        "busy"
+    );
+    stop.finish.send(Ok(())).unwrap();
+    let fresh = Session::new();
+    let receipt = rig.after_release(Some(&fresh), demand(0.6)).await;
+    let call = rig.next().await;
+    assert_eq!(call.params.unwrap().left, 0.6);
+    assert!(!call.request.unwrap().renew);
+    call.finish.send(Ok(())).unwrap();
+    accepted(receipt).await;
+    rig.finish().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn already_expired_queued_command_never_reaches_target() {
+    let mut rig = Rig::new();
+    let stopping = rig.control.submit(None, demand(0.0)).unwrap();
+    let stop = rig.next().await;
+    let queued = rig.control.submit(None, demand(0.5)).unwrap();
+    tokio::time::advance(Duration::from_millis(501)).await;
+    stop.finish.send(Ok(())).unwrap();
+    accepted(stopping).await;
+    assert_eq!(receipt_result(queued).await.unwrap_err().code, "expired");
+    let next = rig.next().await;
+    assert!(next.params.is_none());
+    next.finish.send(Ok(())).unwrap();
+    rig.finish().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn valid_renewal_holds_motion_but_invalid_and_spectator_traffic_does_not() {
+    let mut rig = Rig::new();
+    let owner = Session::new();
+    for index in 0..11 {
+        let receipt = rig.control.submit(Some(&owner), demand(0.4)).unwrap();
+        let call = rig.next().await;
+        assert_eq!(call.request.unwrap().renew, index != 0);
+        call.finish.send(Ok(())).unwrap();
+        accepted(receipt).await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+    }
+    tokio::time::advance(Duration::from_millis(300)).await;
+    assert_eq!(
+        rig.control
+            .submit(Some(&Session::new()), demand(0.7))
+            .unwrap_err()
+            .code,
+        "busy"
+    );
+    assert_eq!(
+        rig.control
+            .submit(Some(&owner), demand(f32::INFINITY))
+            .unwrap_err()
+            .code,
+        "invalid"
+    );
+    assert!(parse_drive(r#"{"ping":true}"#).is_err());
+    assert!(rig.calls.try_recv().is_err());
+    tokio::time::advance(Duration::from_millis(100)).await;
+    let stop = rig.next().await;
+    assert!(stop.params.is_none());
+    stop.finish.send(Ok(())).unwrap();
+    assert_eq!(
+        rig.control
+            .submit(Some(&owner), demand(0.4))
+            .unwrap_err()
+            .code,
+        "expired"
+    );
+    rig.finish().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn one_shot_http_command_expires_in_robot_without_more_requests() {
+    let (send, mut outputs) = mpsc::unbounded_channel();
+    let robot = Robot::new(
+        Arc::new(Mutex::new(RecordingMotor(send))),
+        RobotConfig::default(),
+    )
+    .unwrap();
+    let (control, worker) = Control::start(robot.clone());
+    let app = http_test::init_service(
+        App::new()
+            .app_data(web::Data::new(control.clone()))
+            .app_data(query_config())
+            .route("/drive", web::get().to(drive_robot)),
+    )
+    .await;
+    let response = http_test::call_service(
+        &app,
+        http_test::TestRequest::get()
+            .uri("/drive?left=0.5&right=0.5")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut previous = 0;
+    for _ in 0..5 {
+        tokio::time::advance(Duration::from_millis(10)).await;
+        previous = outputs.recv().await.unwrap();
+        assert_eq!(outputs.recv().await.unwrap(), previous);
+    }
+    assert_eq!(previous, 2048);
+    tokio::time::advance(Duration::from_millis(450)).await;
+    let ramped = outputs.recv().await.unwrap();
+    assert!(ramped > 0 && ramped < previous);
+    assert_eq!(outputs.recv().await.unwrap(), ramped);
+    previous = ramped;
+    for _ in 0..6 {
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let ramped = outputs.recv().await.unwrap();
+        assert!(ramped <= previous && previous - ramped <= 411);
+        assert_eq!(outputs.recv().await.unwrap(), ramped);
+        previous = ramped;
+    }
+    assert_eq!(previous, 0);
+    assert_eq!(robot.status().await.expired_commands, 1);
+    robot.shutdown().await;
+    control.close();
+    worker.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn owner_disconnect_ramps_real_robot_to_zero() {
+    let (send, mut outputs) = mpsc::unbounded_channel();
+    let robot = Robot::new(
+        Arc::new(Mutex::new(RecordingMotor(send))),
+        RobotConfig::default(),
+    )
+    .unwrap();
+    let (control, worker) = Control::start(robot.clone());
+    let owner = Session::new();
+    accepted(
+        control
+            .submit(
+                Some(&owner),
+                DriveParams {
+                    left: 0.5,
+                    right: 0.5,
+                },
+            )
+            .unwrap(),
+    )
+    .await;
+    for _ in 0..5 {
+        tokio::time::advance(Duration::from_millis(10)).await;
+        assert!(outputs.recv().await.unwrap() > 0);
+        assert!(outputs.recv().await.unwrap() > 0);
+    }
+    control.disconnect(&owner);
+    tokio::task::yield_now().await;
+    assert!(outputs.try_recv().is_err());
+    let mut previous = 2048;
+    for _ in 0..7 {
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let ramped = outputs.recv().await.unwrap();
+        assert!(ramped <= previous && previous - ramped <= 411);
+        assert_eq!(outputs.recv().await.unwrap(), ramped);
+        previous = ramped;
+    }
+    assert_eq!(previous, 0);
+    assert_eq!(robot.status().await.expired_commands, 0);
+    robot.shutdown().await;
     control.close();
     worker.await.unwrap();
 }
